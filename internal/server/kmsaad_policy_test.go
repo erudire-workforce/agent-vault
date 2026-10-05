@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // Fork policy tests on a real store, through the HTTP API (and, for whoami,
 // through a real MITM proxy listener). Several of these already pass at
 // v0.40.0; they are regression guards and are listed as such in

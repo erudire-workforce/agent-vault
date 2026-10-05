@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // Shared harness for the server-level kmsaad tests: a real store (Postgres
 // and SQLite via forEachBackend), a real owner session, and every log
 // channel the server can write to captured in memory.

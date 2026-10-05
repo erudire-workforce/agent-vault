@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // Row-bound AAD, end to end through the HTTP API on a real store. Each test
 // writes through the API, tampers with ciphertext columns directly in the
 // database (the threat: write access to the DB or a restored backup, no DEK),

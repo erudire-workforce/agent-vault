@@ -118,15 +118,6 @@ jobs:
       - name: Run tests
         run: go test -race -count=1 ./...
 
-      # internal/server's kmsaad files stay behind the build tag because
-      # kmsaad_policy_test.go also holds the proxy whoami test, whose feature
-      # ships separately. The tests whose features are implemented run here
-      # by name; drop this step when the tag is removed from that package.
-      - name: Run tagged server tests (implemented features)
-        run: >-
-          go test -race -count=1 -tags kmsaad ./internal/server
-          -run 'TestKMSAAD_(API_|WriteOnly_|RegisterRefusedOnceAUserExists|RequireTokenExpiry_|CredentialStoreSwitchingDisabled|NoSecretInLogs_|LogScanner_KnownPositive|ExecutorTokenPrivilegeChecks)'
-
   # Fork policy tests (proxy rules, echo scrubbing, identity header,
   # whoami, netguard, declarative bootstrap) against both store backends.
   # The postgres subtests are required here, not skipped.
@@ -166,11 +157,14 @@ jobs:
       - name: Untagged fork packages (postgres required)
         run: go test -race -count=1 -v ./internal/bootstrap/... ./internal/netguard/ ./internal/identity/ ./internal/scrub/ ./internal/servicepolicy/ ./internal/telemetry/
 
-      # Tagged (kmsaad) tests in this branch's scope. Excluded on purpose:
-      # TestKMSAAD_Wildcard_SingleSegmentOnly, TestKMSAAD_Wildcard_MiddleSegment
-      # and TestKMSAAD_MatchService_SingleSegmentWildcard, which assume "*"
-      # became single-segment; this branch keeps upstream "*" semantics and
-      # adds the opt-in {name} placeholder instead (see the branch report).
+      # The mitm and methodcontract kmsaad files stay behind the build tag
+      # because they hold TestKMSAAD_Wildcard_SingleSegmentOnly,
+      # TestKMSAAD_Wildcard_MiddleSegment and
+      # TestKMSAAD_MatchService_SingleSegmentWildcard, which assume "*"
+      # became single-segment; the fork keeps upstream "*" semantics and adds
+      # the opt-in {name} placeholder instead. Every other test in those files
+      # runs here by name. All other kmsaad suites are untagged and run in
+      # go-test. Drop these steps when those three tests are rewritten.
       - name: Tagged proxy rule, echo and identity tests
         run: >-
           go test -race -count=1 -tags kmsaad ./internal/mitm/
@@ -180,11 +174,6 @@ jobs:
         run: >-
           go test -race -count=1 -tags kmsaad ./internal/broker/methodcontract/
           -run 'TestKMSAAD_(MatchService_MethodAllowlist|MatchService_NilMethodsKeepsUpstreamBehaviour|MatchService_EmptyMethodsDeniesAll|MethodsRoundTripJSON|ValidateMethodsRejectsUnknownVerbs)$' -v
-
-      - name: Tagged whoami and executor privilege tests
-        run: >-
-          go test -race -count=1 -tags kmsaad ./internal/server/
-          -run 'TestKMSAAD_(ProxyWhoami|ExecutorTokenPrivilegeChecks)$' -v
 
   # Security-critical: always run on every PR (see go-test for rationale).
   go-lint:

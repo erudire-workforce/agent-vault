@@ -27,12 +27,11 @@ import (
 	"testing"
 
 	"github.com/Infisical/agent-vault/internal/brokercore"
-	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/store"
 )
 
 // jsonCredStore is a brokercore.CredentialStore backed by a raw services
-// JSON string and nil-AAD credentials (what v0.40.0 stores).
+// JSON string and credentials sealed with row-bound AAD at version 0.
 type jsonCredStore struct {
 	services string
 	key      []byte
@@ -101,7 +100,7 @@ func notionProxy(t *testing.T, servicesJSON string, policy brokercore.UnmatchedH
 	up := newRecordingUpstream(t)
 	host, _, _ := net.SplitHostPort(strings.TrimPrefix(up.srv.URL, "http://"))
 	k := make([]byte, 32)
-	ct, n, err := crypto.Encrypt([]byte(notionTokenValue), k)
+	ct, n, err := store.CredentialValueAAD("v1", "NOTION_TOKEN", 0).Seal([]byte(notionTokenValue), k)
 	if err != nil {
 		t.Fatal(err)
 	}

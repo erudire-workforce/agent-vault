@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // Stored keys are write-only for every role, including the owner. Read
 // endpoints return 403 or metadata only (name, masked hint, version,
 // identity digest, timestamps), never a stored value. At v0.40.0
