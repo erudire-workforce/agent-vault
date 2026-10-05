@@ -59,6 +59,10 @@ func MergeServices(existing []broker.Service, proposed []Service) ([]broker.Serv
 				if len(p.Substitutions) == 0 {
 					next.Substitutions = merged[idx].Substitutions
 				}
+				// Unspecified methods keep the existing allowlist.
+				if p.Methods == nil {
+					next.Methods = merged[idx].Methods
+				}
 				merged[idx] = next
 			default:
 				nameIndex[p.Name] = len(merged)
@@ -91,6 +95,9 @@ func toBrokerService(p Service) broker.Service {
 	}
 	if p.Auth != nil {
 		svc.Auth = *p.Auth
+	}
+	if p.Methods != nil {
+		svc.Methods = append([]string{}, (*p.Methods)...)
 	}
 	if len(p.Substitutions) > 0 {
 		svc.Substitutions = make([]broker.Substitution, len(p.Substitutions))

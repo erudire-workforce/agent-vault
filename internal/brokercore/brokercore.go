@@ -198,6 +198,15 @@ func WriteInjectError(w http.ResponseWriter, err error, targetHost, vaultName, b
 	switch {
 	case errors.Is(err, ErrServiceNotFound):
 		WriteForbiddenHint(w, targetHost, vaultName, baseURL)
+	case errors.Is(err, ErrMethodNotAllowed):
+		writeProxyErrorWithHelp(w, http.StatusForbidden, "method_not_allowed",
+			fmt.Sprintf("The broker service matching host %q in vault %q does not allow this HTTP method", targetHost, vaultName), baseURL)
+	case errors.Is(err, ErrNonCanonicalPath):
+		WriteProxyError(w, http.StatusBadRequest, "non_canonical_path",
+			"Request path contains an encoded slash, dot segment, empty segment or other non-canonical form")
+	case errors.Is(err, ErrServicePolicy):
+		writeProxyErrorWithHelp(w, http.StatusForbidden, "service_policy",
+			fmt.Sprintf("The broker service matching host %q in vault %q is outside the compiled-in service policy", targetHost, vaultName), baseURL)
 	case errors.Is(err, ErrServiceDisabled):
 		writeProxyErrorWithHelp(w, http.StatusForbidden, "service_disabled",
 			fmt.Sprintf("Broker service matching host %q in vault %q is currently disabled", targetHost, vaultName), baseURL)

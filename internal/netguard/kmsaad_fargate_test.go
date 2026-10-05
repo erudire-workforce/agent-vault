@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // The ECS/Fargate task credentials endpoint (169.254.170.2) hands out the
 // task role's AWS credentials. It must be blocked unconditionally, like IMDS,
 // including with AGENT_VAULT_ALLOW_PRIVATE_RANGES=true and when an allowlist

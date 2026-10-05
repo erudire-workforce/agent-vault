@@ -258,6 +258,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		s.redirectOAuthComplete(w, r, "", "", "error", "Failed to store tokens")
 		return
 	}
+	s.scheduleIdentityProbe(st.VaultID, st.CredentialKey)
 
 	// Resolve vault name for the redirect.
 	vaultName := ""
@@ -468,6 +469,7 @@ func (s *Server) handleOAuthTokenUpload(w http.ResponseWriter, r *http.Request) 
 			jsonError(w, http.StatusInternalServerError, "Failed to store tokens")
 			return
 		}
+		s.scheduleIdentityProbe(ns.ID, req.Key)
 
 		now := time.Now().UTC().Format(time.RFC3339)
 		jsonOK(w, map[string]interface{}{"connected": true, "connected_at": now})
@@ -534,6 +536,7 @@ func (s *Server) handleOAuthTokenUpload(w http.ResponseWriter, r *http.Request) 
 		jsonError(w, http.StatusInternalServerError, "Failed to store tokens")
 		return
 	}
+	s.scheduleIdentityProbe(ns.ID, req.Key)
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	jsonOK(w, map[string]interface{}{"connected": true, "connected_at": now})

@@ -84,11 +84,13 @@ func (t *Telemetry) Close() {
 	_ = t.client.Close()
 }
 
-// IsDisabled returns true when the AGENT_VAULT_TELEMETRY env var is
-// set to "false" or "0".
+// IsDisabled reports whether telemetry is off. In this fork telemetry is
+// opt-in: it is off unless AGENT_VAULT_TELEMETRY is explicitly "true" or
+// "1", so a default install makes no network call to the analytics
+// endpoint.
 func IsDisabled() bool {
-	v := strings.ToLower(os.Getenv("AGENT_VAULT_TELEMETRY"))
-	return v == "false" || v == "0"
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("AGENT_VAULT_TELEMETRY")))
+	return v != "true" && v != "1"
 }
 
 var (

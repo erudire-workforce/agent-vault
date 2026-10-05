@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 package crypto
 
 import (

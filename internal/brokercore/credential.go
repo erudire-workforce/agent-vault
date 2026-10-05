@@ -2,17 +2,21 @@ package brokercore
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/broker"
 	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/oauth"
+	"github.com/Infisical/agent-vault/internal/servicepolicy"
 	"github.com/Infisical/agent-vault/internal/store"
 )
 
@@ -57,6 +61,19 @@ type InjectResult struct {
 	// Passthrough is set when no service matched but the unmatched-host
 	// policy permitted forwarding.
 	Passthrough bool
+
+	// CredentialIdentity is the recorded identity digest (see package
+	// identity) of the account the injected credential acts as, or ""
+	// when none is recorded for the exact stored value that was
+	// injected. Not secret.
+	CredentialIdentity string
+
+	// ProbeBinding is set only for WithProbeService calls: the
+	// CiphertextBinding of the single stored value that was injected, or
+	// "" when the value was not a plain stored credential (dynamic, or
+	// refreshed during the call). The probe records its digest under this
+	// binding, never under a binding read separately.
+	ProbeBinding string
 }
 
 // CredentialProvider resolves a service for (targetHost, targetPath) in
@@ -98,6 +115,11 @@ type StoreCredentialProvider struct {
 	EncKey     []byte
 	Refresher  *oauth.Refresher          // nil = no OAuth refresh
 	Dynamic    DynamicCredentialResolver // nil = no dynamic-secret resolution
+
+	// OnCredentialRefreshed, when set, is called (in its own goroutine)
+	// after an OAuth refresh minted a new access token, so the identity
+	// probe can re-run for the new value.
+	OnCredentialRefreshed func(vaultID, key string)
 }
 
 // NewStoreCredentialProvider constructs a provider. encKey must be 32 bytes.
@@ -142,7 +164,23 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 	if targetPath == "" {
 		targetPath = "/"
 	}
-	matched, score := broker.MatchService(matchHost, targetPort, targetPath, services)
+	// The matcher must see exactly what is forwarded. Callers pass the
+	// decoded path after CanonicalRequestPath; refuse anything that could
+	// still be read differently by the upstream.
+	if !IsCanonicalPath(targetPath) {
+		return nil, ErrNonCanonicalPath
+	}
+	matched, score, methodDenied := broker.MatchServiceDetail(RequestMethod(ctx), matchHost, targetPort, targetPath, services)
+	probe := probeServiceFrom(ctx)
+	if probe != nil {
+		// Identity probe: resolve the given service's auth through the
+		// normal injection path, regardless of its path/method rules.
+		// Only server-side code can set this; the proxy never does.
+		matched, methodDenied = probe, false
+	}
+	if methodDenied {
+		return nil, ErrMethodNotAllowed
+	}
 	if matched == nil {
 		// Fail closed on policy lookup errors so a transient store
 		// failure can't silently strip enforcement.
@@ -154,6 +192,13 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 	}
 	if !matched.IsEnabled() {
 		return nil, ErrServiceDisabled
+	}
+	// Re-check the compiled-in policy at request time so a services row
+	// written behind the API (or before the mode was enabled) is refused.
+	if servicepolicy.Active() && probe == nil {
+		if err := servicepolicy.CheckService(*matched); err != nil {
+			return nil, ErrServicePolicy
+		}
 	}
 	slog.Default().Debug("broker matched",
 		slog.String("vault", vaultID),
@@ -168,6 +213,9 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 	// Memoize per-key lookups so a credential shared by auth and a
 	// substitution decrypts only once.
 	cache := make(map[string]string)
+	// storedDigest binds each static value to the exact ciphertext row it
+	// came from, so a recorded identity is used only for that value.
+	storedDigest := make(map[string]string)
 	getCredential := func(key string) (string, error) {
 		if v, ok := cache[key]; ok {
 			return v, nil
@@ -196,11 +244,21 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 			return "", fmt.Errorf("%w: credential %q", ErrOAuthNotConnected, key)
 		}
 
+		storedDigest[key] = CiphertextBinding(cred.Ciphertext)
 		if cred.Type == "oauth" && p.Refresher != nil && p.OAuthStore != nil {
-			s, err = p.maybeRefreshOAuth(ctx, vaultID, key, s)
+			refreshed, err := p.maybeRefreshOAuth(ctx, vaultID, key, s)
 			if err != nil {
 				return "", err
 			}
+			if refreshed != s {
+				// A new access token was minted: the recorded identity was
+				// bound to the old value. Re-probe in the background.
+				delete(storedDigest, key)
+				if p.OnCredentialRefreshed != nil {
+					go p.OnCredentialRefreshed(vaultID, key)
+				}
+			}
+			s = refreshed
 		}
 
 		cache[key] = s
@@ -249,7 +307,78 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 
 	result.Headers = headers
 	result.Substitutions = resolvedSubs
+	result.CredentialIdentity = p.recordedIdentity(ctx, vaultID, matched.Auth.CredentialKeys(), storedDigest)
+	if probe != nil {
+		if keys := matched.Auth.CredentialKeys(); len(keys) == 1 {
+			result.ProbeBinding = storedDigest[keys[0]]
+		}
+	}
 	return result, nil
+}
+
+type probeCtxKey struct{}
+
+// WithProbeService makes Inject resolve svc's auth directly instead of
+// matching the request against the vault's services. It is used only by
+// the server-side identity probe, which must call the provider's identity
+// endpoint (for Notion, GET /v1/users/me) even when the vault's rules
+// allow only other paths.
+func WithProbeService(ctx context.Context, svc broker.Service) context.Context {
+	return context.WithValue(ctx, probeCtxKey{}, &svc)
+}
+
+func probeServiceFrom(ctx context.Context) *broker.Service {
+	s, _ := ctx.Value(probeCtxKey{}).(*broker.Service)
+	return s
+}
+
+// IdentityStore is the optional store surface for recorded credential
+// identity digests. StoreCredentialProvider uses it when its Store
+// implements it.
+type IdentityStore interface {
+	GetVaultSetting(ctx context.Context, vaultID, key string) (string, error)
+}
+
+// IdentitySettingKey is the vault-setting key holding the identity record
+// for credential key. Value format: "<binding>:<digest>" where binding is
+// CiphertextBinding of the stored value the probe ran with.
+func IdentitySettingKey(credentialKey string) string {
+	return "credential_identity:" + credentialKey
+}
+
+// CiphertextBinding is the non-secret handle that ties an identity record
+// to one stored value. Every credential write produces a fresh nonce and
+// ciphertext, so any change to the value invalidates the record.
+func CiphertextBinding(ciphertext []byte) string {
+	sum := sha256.Sum256(ciphertext)
+	return hex.EncodeToString(sum[:16])
+}
+
+// recordedIdentity returns the digest recorded for the single credential
+// the auth config injects, provided it was recorded for the exact stored
+// value used now. Services that inject several keys, or none, get "".
+func (p *StoreCredentialProvider) recordedIdentity(ctx context.Context, vaultID string, authKeys []string, bindings map[string]string) string {
+	if len(authKeys) != 1 {
+		return ""
+	}
+	key := authKeys[0]
+	binding, ok := bindings[key]
+	if !ok {
+		return ""
+	}
+	is, ok := p.Store.(IdentityStore)
+	if !ok {
+		return ""
+	}
+	rec, err := is.GetVaultSetting(ctx, vaultID, IdentitySettingKey(key))
+	if err != nil {
+		return ""
+	}
+	gotBinding, digest, ok := strings.Cut(rec, ":")
+	if !ok || gotBinding != binding || len(digest) != 64 {
+		return ""
+	}
+	return digest
 }
 
 const oauthRefreshBuffer = 5 * time.Minute

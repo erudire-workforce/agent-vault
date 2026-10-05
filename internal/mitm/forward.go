@@ -1,6 +1,9 @@
 package mitm
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +18,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/ratelimit"
 	"github.com/Infisical/agent-vault/internal/requestlog"
+	"github.com/Infisical/agent-vault/internal/scrub"
 )
 
 type flushingWriter struct {
@@ -205,7 +209,23 @@ func (p *Proxy) forwardRequest(
 		AuthHeader: authHeader,
 	}
 	actorType, actorID := actorFromScope(scope)
+	// injected collects every InjectResult whose credentials were sent
+	// upstream (first attempt and 401 retry); final is the one used on
+	// the attempt whose response is relayed. Echoes of any injected value
+	// are scrubbed from the response, the logs and the request log.
+	var injected []*brokercore.InjectResult
+	var final *brokercore.InjectResult
+	var scrubber *scrub.Scrubber
+	scrubbedFor := -1
+	sc := func() *scrub.Scrubber {
+		if scrubbedFor != len(injected) {
+			scrubber = scrub.New(injectedSecrets(injected)...)
+			scrubbedFor = len(injected)
+		}
+		return scrubber
+	}
 	emit := func(status int, errCode string) {
+		event.Path = sc().String(event.Path)
 		event.Emit(p.logger, start, status, errCode)
 		p.logSink.Record(r.Context(), requestlog.FromEvent(event, scope.VaultID, actorType, actorID))
 	}
@@ -238,7 +258,18 @@ func (p *Proxy) forwardRequest(
 		return
 	}
 
-	inject, err := p.creds.Inject(r.Context(), scope.VaultID, host, port, r.URL.Path)
+	// Match on exactly the path that is forwarded: refuse encoded
+	// slashes, dot segments and empty segments instead of letting the
+	// matcher and the upstream read the path differently.
+	matchPath, err := brokercore.CanonicalRequestPath(r.URL)
+	if err != nil {
+		brokercore.WriteInjectError(w, err, target, scope.VaultName, p.baseURL)
+		emit(http.StatusBadRequest, "non_canonical_path")
+		return
+	}
+	ctx := brokercore.WithRequestMethod(r.Context(), r.Method)
+
+	inject, err := p.creds.Inject(ctx, scope.VaultID, host, port, matchPath)
 	if inject != nil {
 		event.MatchedService = inject.MatchedName
 		event.MatchedHost = inject.MatchedHost
@@ -250,15 +281,25 @@ func (p *Proxy) forwardRequest(
 	if err != nil {
 		errCode := "no_match"
 		status := http.StatusForbidden
-		if errors.Is(err, brokercore.ErrCredentialMissing) {
+		switch {
+		case errors.Is(err, brokercore.ErrCredentialMissing):
 			errCode = "credential_not_found"
 			status = http.StatusBadGateway
 			brokercore.LogCredentialMissing(p.logger, scope.VaultID, event.MatchedService, event.CredentialKeys)
+		case errors.Is(err, brokercore.ErrMethodNotAllowed):
+			errCode = "method_not_allowed"
+		case errors.Is(err, brokercore.ErrServicePolicy):
+			errCode = "service_policy"
+		case errors.Is(err, brokercore.ErrNonCanonicalPath):
+			errCode = "non_canonical_path"
+			status = http.StatusBadRequest
 		}
 		brokercore.WriteInjectError(w, err, target, scope.VaultName, p.baseURL)
 		emit(status, errCode)
 		return
 	}
+	injected = append(injected, inject)
+	final = inject
 
 	var body io.ReadCloser
 	var contentLength int64
@@ -330,8 +371,14 @@ func (p *Proxy) forwardRequest(
 		if len(wsSubs) > 0 {
 			outReq.Header.Del("Sec-Websocket-Extensions")
 		}
-		p.forwardWebSocket(w, r, outReq, wsSubs, emit)
+		p.forwardWebSocket(w, r, outReq, wsSubs, sc(), credentialIdentityHeaderValue(final), emit)
 		return
+	}
+
+	if !sc().Empty() {
+		// Let the transport negotiate gzip itself so it decodes the body
+		// transparently; an encoded body cannot be scrubbed for echoes.
+		outReq.Header.Del("Accept-Encoding")
 	}
 
 	resp, err := p.upstream.RoundTrip(outReq)
@@ -340,7 +387,7 @@ func (p *Proxy) forwardRequest(
 			slog.String("vault_id", scope.VaultID),
 			slog.String("vault_name", scope.VaultName),
 			slog.String("target_host", target),
-			slog.String("error", err.Error()),
+			slog.String("error", sc().String(err.Error())),
 		)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		emit(http.StatusBadGateway, "upstream_error")
@@ -352,9 +399,11 @@ func (p *Proxy) forwardRequest(
 	// (GET/HEAD) are retried — the request body is consumed and cannot be replayed.
 	if resp.StatusCode == http.StatusUnauthorized && inject != nil && !inject.Passthrough &&
 		(r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		_ = resp.Body.Close()
-		retryInject, retryErr := p.creds.Inject(r.Context(), scope.VaultID, host, port, r.URL.Path)
+		retryInject, retryErr := p.creds.Inject(ctx, scope.VaultID, host, port, matchPath)
 		if retryErr == nil && retryInject != nil && retryInject.Headers != nil {
+			// Scrub the retry credential too, even if the retry fails:
+			// the upstream may have seen and echoed it.
+			injected = append(injected, retryInject)
 			retryReq := outReq.Clone(outReq.Context())
 			for k, v := range retryInject.Headers {
 				retryReq.Header.Set(k, v)
@@ -362,10 +411,12 @@ func (p *Proxy) forwardRequest(
 			retryReq.Body = http.NoBody
 			retryReq.ContentLength = 0
 			if retryResp, retryRTErr := p.upstream.RoundTrip(retryReq); retryRTErr == nil {
+				_ = resp.Body.Close()
 				resp = retryResp
+				final = retryInject
 				p.logger.Debug("oauth 401 retry succeeded",
 					slog.String("host", host),
-					slog.String("path", r.URL.Path),
+					slog.String("path", sc().String(r.URL.Path)),
 					slog.Int("status", resp.StatusCode),
 				)
 			}
@@ -374,11 +425,26 @@ func (p *Proxy) forwardRequest(
 
 	defer func() { _ = resp.Body.Close() }()
 
+	p.writeUpstreamResponse(w, r, resp, sc(), credentialIdentityHeaderValue(final), target, emit)
+}
+
+// writeUpstreamResponse relays resp to the client: header hygiene, the
+// credential identity header, echo scrubbing of headers and body, and the
+// response-size limit. emit is called exactly once.
+func (p *Proxy) writeUpstreamResponse(
+	w http.ResponseWriter,
+	r *http.Request,
+	resp *http.Response,
+	sc *scrub.Scrubber,
+	identity string,
+	target string,
+	emit func(status int, errCode string),
+) {
 	if p.maxResponseBytes > 0 && resp.ContentLength > 0 && resp.ContentLength > p.maxResponseBytes {
 		_ = resp.Body.Close()
 		p.logger.Warn("response body exceeds limit",
 			slog.String("host", target),
-			slog.String("path", r.URL.Path),
+			slog.String("path", sc.String(r.URL.Path)),
 			slog.Int64("content_length", resp.ContentLength),
 			slog.Int64("max_response_bytes", p.maxResponseBytes),
 		)
@@ -389,32 +455,57 @@ func (p *Proxy) forwardRequest(
 		return
 	}
 
+	scrubbing := !sc.Empty()
+	if scrubbing {
+		// The transport decodes gzip it negotiated itself (Accept-Encoding
+		// was removed from the outbound request). Anything still encoded
+		// cannot be inspected for echoes, so it is not relayed.
+		if ce := strings.TrimSpace(resp.Header.Get("Content-Encoding")); ce != "" && !strings.EqualFold(ce, "identity") {
+			_ = resp.Body.Close()
+			brokercore.WriteProxyError(w, http.StatusBadGateway, "response_encoding_unsupported",
+				"Upstream response uses a content encoding the proxy cannot inspect for credential echoes.")
+			emit(http.StatusBadGateway, "response_encoding_unsupported")
+			return
+		}
+	}
+
+	out := w.Header()
 	for k, vv := range resp.Header {
-		if brokercore.ShouldStripResponseHeader(k) {
+		if brokercore.ShouldStripResponseHeader(k) || IsAgentVaultHeader(k) {
 			continue
 		}
 		for _, v := range vv {
-			w.Header().Add(k, v)
+			out.Add(k, v)
 		}
 	}
+	if scrubbing {
+		sc.Header(out)
+		// The body length changes when an echo is replaced.
+		if r.Method != http.MethodHead {
+			out.Del("Content-Length")
+		}
+	}
+	out.Set(CredentialIdentityHeader, identity)
 	w.WriteHeader(resp.StatusCode)
 
 	var src io.Reader = resp.Body
 	if p.maxResponseBytes > 0 {
 		src = io.LimitReader(resp.Body, p.maxResponseBytes)
 	}
-	var dst io.Writer = w
+	var flush func()
 	if f, ok := w.(http.Flusher); ok {
-		dst = &flushingWriter{w: w, f: f}
+		flush = f.Flush
 	}
-	n, _ := io.Copy(dst, src)
+	sw := sc.NewWriter(w, flush)
+	n, _ := io.Copy(sw, src)
+	_ = sw.Close()
 
 	if p.maxResponseBytes > 0 && n == p.maxResponseBytes {
 		var probe [1]byte
 		if extra, _ := resp.Body.Read(probe[:]); extra > 0 {
 			p.logger.Warn("response body truncated mid-stream, aborting connection",
 				slog.String("host", target),
-				slog.String("path", r.URL.Path),
+				slog.String("path", sc.String(r.URL.Path)),
 				slog.Int64("bytes_streamed", n),
 				slog.Int64("max_response_bytes", p.maxResponseBytes),
 			)
@@ -424,6 +515,75 @@ func (p *Proxy) forwardRequest(
 	}
 
 	emit(resp.StatusCode, "")
+}
+
+// CredentialIdentityHeader is set by the proxy on every relayed upstream
+// response. It describes the credential injected on the final attempt.
+const CredentialIdentityHeader = "X-Agent-Vault-Credential-Identity"
+
+// agentVaultHeaderPrefix marks headers only Agent Vault may set. Any
+// upstream header with this prefix is dropped before relaying, so an
+// upstream cannot spoof the identity or a proxy-error marker.
+const agentVaultHeaderPrefix = "x-agent-vault-"
+
+// IsAgentVaultHeader reports whether name is reserved for Agent Vault.
+func IsAgentVaultHeader(name string) bool {
+	return len(name) >= len(agentVaultHeaderPrefix) &&
+		strings.EqualFold(name[:len(agentVaultHeaderPrefix)], agentVaultHeaderPrefix)
+}
+
+// credentialIdentityHeaderValue describes the credential in inj without
+// revealing it: the recorded identity digest when one is bound to the
+// injected value, "unverified:<fingerprint of service and key names>"
+// when none is, and "none" when nothing was injected.
+func credentialIdentityHeaderValue(inj *brokercore.InjectResult) string {
+	if inj == nil || inj.Passthrough || (len(inj.Headers) == 0 && len(inj.Substitutions) == 0) {
+		return "none"
+	}
+	if inj.CredentialIdentity != "" {
+		return inj.CredentialIdentity
+	}
+	h := sha256.New()
+	_, _ = io.WriteString(h, inj.MatchedName)
+	for _, k := range inj.CredentialKeys {
+		_, _ = io.WriteString(h, "\x00"+k)
+	}
+	return "unverified:" + hex.EncodeToString(h.Sum(nil)[:12])
+}
+
+// injectedSecrets returns every secret value the injections attached:
+// header values (and the credential inside an auth scheme) plus
+// substitution values.
+func injectedSecrets(injs []*brokercore.InjectResult) []string {
+	var out []string
+	for _, inj := range injs {
+		if inj == nil {
+			continue
+		}
+		for _, v := range inj.Headers {
+			out = append(out, v)
+			if scheme, rest, ok := strings.Cut(v, " "); ok && rest != "" {
+				out = append(out, rest)
+				if strings.EqualFold(scheme, "basic") {
+					if dec, err := base64.StdEncoding.DecodeString(rest); err == nil {
+						out = append(out, string(dec))
+						if user, pass, ok := strings.Cut(string(dec), ":"); ok {
+							out = append(out, pass)
+							// Long usernames are API keys (e.g. key-as-username
+							// schemes); short ones are ordinary words.
+							if len(user) >= 12 {
+								out = append(out, user)
+							}
+						}
+					}
+				}
+			}
+		}
+		for _, s := range inj.Substitutions {
+			out = append(out, s.Value)
+		}
+	}
+	return out
 }
 
 // knownAPIKeyHeaders are non-Authorization headers that commonly carry

@@ -178,6 +178,10 @@ func (p *Proxy) dispatch(w http.ResponseWriter, r *http.Request) {
 		p.handleForward(w, r)
 		return
 	}
+	if isWhoamiRequest(r) {
+		p.handleWhoami(w, r)
+		return
+	}
 	// Origin-form (no scheme/host), https://, ws://, file://, gopher://,
 	// etc. all land here. The CONNECT-vs-forward split above already
 	// covers every legitimate forward-proxy shape; anything else is a

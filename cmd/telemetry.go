@@ -10,7 +10,7 @@ import (
 var tel *telemetry.Telemetry
 
 func init() {
-	rootCmd.PersistentFlags().Bool("telemetry", true, "enable anonymous usage telemetry (also respects AGENT_VAULT_TELEMETRY env var)")
+	rootCmd.PersistentFlags().Bool("telemetry", false, "enable anonymous usage telemetry (off by default; also requires AGENT_VAULT_TELEMETRY=true)")
 	cobra.OnInitialize(initTelemetry)
 }
 
