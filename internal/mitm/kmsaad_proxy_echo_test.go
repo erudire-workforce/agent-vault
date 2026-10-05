@@ -1,9 +1,7 @@
-//go:build kmsaad
-
 // Runtime tests through the real proxy listener for:
 //   - X-Agent-Vault-Credential-Identity on the OAuth 401 retry path
 //     (forward.go:350-371) describing the credential used on the final attempt;
-//   - path normalization: the single-segment "*" match runs on the same
+//   - path normalization: the single-segment match runs on the same
 //     normalized path that is forwarded (%2F, "..", "//");
 //   - response echo scrubbing: every raw, base64, base64url and
 //     percent-encoded occurrence of the injected credential is replaced with

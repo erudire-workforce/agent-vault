@@ -157,24 +157,6 @@ jobs:
       - name: Untagged fork packages (postgres required)
         run: go test -race -count=1 -v ./internal/bootstrap/... ./internal/netguard/ ./internal/identity/ ./internal/scrub/ ./internal/servicepolicy/ ./internal/telemetry/
 
-      # The mitm and methodcontract kmsaad files stay behind the build tag
-      # because they hold TestKMSAAD_Wildcard_SingleSegmentOnly,
-      # TestKMSAAD_Wildcard_MiddleSegment and
-      # TestKMSAAD_MatchService_SingleSegmentWildcard, which assume "*"
-      # became single-segment; the fork keeps upstream "*" semantics and adds
-      # the opt-in {name} placeholder instead. Every other test in those files
-      # runs here by name. All other kmsaad suites are untagged and run in
-      # go-test. Drop these steps when those three tests are rewritten.
-      - name: Tagged proxy rule, echo and identity tests
-        run: >-
-          go test -race -count=1 -tags kmsaad ./internal/mitm/
-          -run 'TestKMSAAD_(RetryPath_IdentityDescribesFinalCredential|PathNormalization_MatchesWhatIsForwarded|EchoScrub_ResponseHeadersBodyAndLogs|EchoScrub_RetryPath|WriteHold_PatchPagesRefused_GetAllowed|WriteHold_EmptyMethodsDeniesAll|HeaderHygiene_SpoofedIdentityStripped)$' -v
-
-      - name: Tagged method contract tests
-        run: >-
-          go test -race -count=1 -tags kmsaad ./internal/broker/methodcontract/
-          -run 'TestKMSAAD_(MatchService_MethodAllowlist|MatchService_NilMethodsKeepsUpstreamBehaviour|MatchService_EmptyMethodsDeniesAll|MethodsRoundTripJSON|ValidateMethodsRejectsUnknownVerbs)$' -v
-
   # Security-critical: always run on every PR (see go-test for rationale).
   go-lint:
     runs-on: ubuntu-latest

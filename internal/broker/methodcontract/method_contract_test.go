@@ -1,8 +1,4 @@
-//go:build kmsaad
-
-// Package methodcontract_test pins the per-method service rule API. Separate
-// directory so the expected pre-patch compile failure does not stop the
-// existing internal/broker tests under -tags kmsaad.
+// Package methodcontract_test pins the per-method service rule API.
 //
 // Intended API:
 //
@@ -83,16 +79,34 @@ func TestKMSAAD_ValidateMethodsRejectsUnknownVerbs(t *testing.T) {
 	}
 }
 
-// "*" is exactly one path segment (decision pending: see FAILURE_MODES, the
-// upstream test TestMatchServicePathWildcardCrossSlash pins the opposite).
+// The opt-in "{name}" placeholder is exactly one non-empty path segment.
+// "*" keeps its upstream greedy meaning (TestMatchServicePathWildcardCrossSlash).
+// Encoded "%2F" and ".." are handled by proxy path normalization before
+// matching; see TestKMSAAD_Wildcard_SingleSegmentOnly in internal/mitm.
 func TestKMSAAD_MatchService_SingleSegmentWildcard(t *testing.T) {
-	svcs := notion(nil)
-	if s, _ := broker.MatchService("GET", "api.notion.com", 0, "/v1/pages/abc", svcs); s == nil {
-		t.Fatal("/v1/pages/* must match /v1/pages/abc")
+	svcs := []broker.Service{{
+		Name: "pages", Host: "api.example.test", Path: "/v1/pages/{id}",
+		Auth: broker.Auth{Type: "bearer", Token: "EXAMPLE_TOKEN"},
+	}}
+	if s, _ := broker.MatchService("GET", "api.example.test", 0, "/v1/pages/abc", svcs); s == nil {
+		t.Fatal("/v1/pages/{id} must match /v1/pages/abc")
 	}
-	for _, p := range []string{"/v1/pages/abc/children", "/v1/pages/", "/v1/pages/a/b"} {
-		if s, _ := broker.MatchService("GET", "api.notion.com", 0, p, svcs); s != nil {
-			t.Errorf("/v1/pages/* matched %s", p)
+	for _, p := range []string{"/v1/pages/abc/children", "/v1/pages/", "/v1/pages/a/b", "/v1/pages//abc", "/v1/pages/abc/"} {
+		if s, _ := broker.MatchService("GET", "api.example.test", 0, p, svcs); s != nil {
+			t.Errorf("/v1/pages/{id} matched %s", p)
+		}
+	}
+
+	mid := []broker.Service{{
+		Name: "children", Host: "api.example.test", Path: "/v1/blocks/{id}/children",
+		Auth: broker.Auth{Type: "bearer", Token: "EXAMPLE_TOKEN"},
+	}}
+	if s, _ := broker.MatchService("GET", "api.example.test", 0, "/v1/blocks/abc/children", mid); s == nil {
+		t.Fatal("/v1/blocks/{id}/children must match /v1/blocks/abc/children")
+	}
+	for _, p := range []string{"/v1/blocks/a/b/children", "/v1/blocks//children", "/v1/blocks/children"} {
+		if s, _ := broker.MatchService("GET", "api.example.test", 0, p, mid); s != nil {
+			t.Errorf("/v1/blocks/{id}/children matched %s", p)
 		}
 	}
 }

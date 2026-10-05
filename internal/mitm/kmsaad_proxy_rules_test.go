@@ -1,10 +1,8 @@
-//go:build kmsaad
-
 // Runtime tests through the real proxy listener for:
 //   - per-method service rules ("methods" on broker.Service, deny by default
 //     when set, enforced as a hard 403 rather than falling through to the
 //     unmatched-host passthrough);
-//   - exact single-segment "*" path wildcards;
+//   - the opt-in single-segment "{name}" path placeholder;
 //   - X-Agent-Vault-* response header hygiene.
 //
 // Services are given as JSON exactly as they are stored in broker_configs, so
@@ -167,30 +165,77 @@ func TestKMSAAD_WriteHold_EmptyMethodsDeniesAll(t *testing.T) {
 	}
 }
 
-// "*" matches exactly one path segment: /v1/pages/* must not cover
-// /v1/pages/{id}/children or deeper paths.
-func TestKMSAAD_Wildcard_SingleSegmentOnly(t *testing.T) {
-	up, c := notionProxy(t, `[{"name":"n","host":"UPSTREAM_HOST","path":"/v1/pages/*","auth":{"type":"bearer","token":"NOTION_TOKEN"}}]`, brokercore.PolicyDeny)
-	if code := send(t, c, http.MethodGet, up.srv.URL+"/v1/pages/abc"); code != http.StatusOK {
-		t.Fatalf("control: GET /v1/pages/abc = %d", code)
+// sendRaw sends a GET whose path is used exactly as written (no client-side
+// cleaning or re-escaping) and reports the status and whether the upstream
+// received a new request carrying the credential.
+func sendRaw(t *testing.T, c *http.Client, up *recordingUpstream, rawPath string) (int, bool) {
+	t.Helper()
+	before := up.last()
+	u, err := url.Parse(up.srv.URL + rawPath)
+	if err != nil {
+		t.Fatalf("parse %s: %v", rawPath, err)
 	}
-	code := send(t, c, http.MethodGet, up.srv.URL+"/v1/pages/abc/children/secret")
-	if strings.Contains(up.last(), "/v1/pages/abc/children/secret") {
-		t.Errorf("/v1/pages/* matched a multi-segment path and forwarded it with the credential (%q)", up.last())
+	req, _ := http.NewRequest(http.MethodGet, u.String(), nil)
+	req.URL = u
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", rawPath, err)
 	}
-	if code != http.StatusForbidden {
-		t.Errorf("GET /v1/pages/abc/children/secret = %d, want 403 under deny policy", code)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	got := up.last()
+	return resp.StatusCode, got != before && strings.Contains(got, "auth=Bearer "+notionTokenValue)
+}
+
+// assertOneSegment checks that every path in escapes is refused (403, or 400
+// from path normalization) and never forwarded with the credential.
+func assertOneSegment(t *testing.T, c *http.Client, up *recordingUpstream, pattern string, escapes []string) {
+	t.Helper()
+	for _, p := range escapes {
+		code, forwarded := sendRaw(t, c, up, p)
+		if forwarded {
+			t.Errorf("%s matched %s and forwarded it with the credential (%q)", pattern, p, up.last())
+		}
+		if code != http.StatusForbidden && code != http.StatusBadRequest {
+			t.Errorf("GET %s = %d, want 403 (or 400 from normalization) under deny policy", p, code)
+		}
 	}
 }
 
+// The opt-in "{name}" placeholder matches exactly one path segment:
+// /v1/pages/{id} must not cover deeper paths, whether the extra segment is a
+// plain "/", an encoded "%2F", a ".." traversal or an empty "//" segment.
+// ("*" keeps its upstream greedy meaning; see broker_test.go.)
+func TestKMSAAD_Wildcard_SingleSegmentOnly(t *testing.T) {
+	up, c := notionProxy(t, `[{"name":"n","host":"UPSTREAM_HOST","path":"/v1/pages/{id}","auth":{"type":"bearer","token":"NOTION_TOKEN"}}]`, brokercore.PolicyDeny)
+	if code := send(t, c, http.MethodGet, up.srv.URL+"/v1/pages/abc"); code != http.StatusOK {
+		t.Fatalf("control: GET /v1/pages/abc = %d", code)
+	}
+	assertOneSegment(t, c, up, "/v1/pages/{id}", []string{
+		"/v1/pages/abc/children/secret",
+		"/v1/pages/abc%2Fchildren",
+		"/v1/pages/abc%2fchildren",
+		"/v1/pages/abc/../../users/me",
+		"/v1/pages/%2e%2e",
+		"/v1/pages//abc",
+		"/v1/pages/abc//children",
+		"/v1/pages/",
+	})
+}
+
 func TestKMSAAD_Wildcard_MiddleSegment(t *testing.T) {
-	up, c := notionProxy(t, `[{"name":"n","host":"UPSTREAM_HOST","path":"/v1/blocks/*/children","auth":{"type":"bearer","token":"NOTION_TOKEN"}}]`, brokercore.PolicyDeny)
+	up, c := notionProxy(t, `[{"name":"n","host":"UPSTREAM_HOST","path":"/v1/blocks/{id}/children","auth":{"type":"bearer","token":"NOTION_TOKEN"}}]`, brokercore.PolicyDeny)
 	if code := send(t, c, http.MethodGet, up.srv.URL+"/v1/blocks/abc/children"); code != http.StatusOK {
 		t.Fatalf("control: GET /v1/blocks/abc/children = %d", code)
 	}
-	if code := send(t, c, http.MethodGet, up.srv.URL+"/v1/blocks/a/b/children"); code != http.StatusForbidden {
-		t.Errorf("/v1/blocks/*/children matched /v1/blocks/a/b/children (status %d)", code)
-	}
+	assertOneSegment(t, c, up, "/v1/blocks/{id}/children", []string{
+		"/v1/blocks/a/b/children",
+		"/v1/blocks/a%2Fb/children",
+		"/v1/blocks/a/../b/children",
+		"/v1/blocks/../children",
+		"/v1/blocks//children",
+		"/v1/blocks/a//children",
+	})
 }
 
 // Upstream-supplied X-Agent-Vault-* headers must never reach the client; the proxy
