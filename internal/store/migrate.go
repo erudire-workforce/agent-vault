@@ -249,7 +249,7 @@ func copyInstanceSettings(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDia
 
 func copyMasterKey(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDialect Dialect) (int, error) {
 	rows, err := src.db.QueryContext(ctx,
-		"SELECT id, sentinel, sentinel_nonce, dek_ciphertext, dek_nonce, dek_plaintext, salt, kdf_time, kdf_memory, kdf_threads, created_at FROM master_key")
+		"SELECT id, sentinel, sentinel_nonce, dek_ciphertext, dek_nonce, dek_plaintext, salt, kdf_time, kdf_memory, kdf_threads, kms_wrapped_dek, kms_key_id, created_at FROM master_key")
 	if err != nil {
 		return 0, err
 	}
@@ -258,10 +258,10 @@ func copyMasterKey(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDialect Di
 	n := 0
 	for rows.Next() {
 		var id int
-		var sentinel, sentinelNonce, dekCT, dekNonce, dekPlain, salt []byte
-		var kdfTime, kdfMemory, kdfThreads interface{}
+		var sentinel, sentinelNonce, dekCT, dekNonce, dekPlain, salt, kmsWrapped []byte
+		var kdfTime, kdfMemory, kdfThreads, kmsKeyID interface{}
 		var createdAt interface{}
-		if err := rows.Scan(&id, &sentinel, &sentinelNonce, &dekCT, &dekNonce, &dekPlain, &salt, &kdfTime, &kdfMemory, &kdfThreads, &createdAt); err != nil {
+		if err := rows.Scan(&id, &sentinel, &sentinelNonce, &dekCT, &dekNonce, &dekPlain, &salt, &kdfTime, &kdfMemory, &kdfThreads, &kmsWrapped, &kmsKeyID, &createdAt); err != nil {
 			return n, err
 		}
 		ts, err := convertTime(createdAt, src.dialect, dstDialect)
@@ -269,8 +269,8 @@ func copyMasterKey(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDialect Di
 			return n, fmt.Errorf("converting created_at: %w", err)
 		}
 		_, err = tx.ExecContext(ctx,
-			dstDialect.Rebind("INSERT INTO master_key (id, sentinel, sentinel_nonce, dek_ciphertext, dek_nonce, dek_plaintext, salt, kdf_time, kdf_memory, kdf_threads, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
-			id, sentinel, sentinelNonce, dekCT, dekNonce, dekPlain, salt, kdfTime, kdfMemory, kdfThreads, ts,
+			dstDialect.Rebind("INSERT INTO master_key (id, sentinel, sentinel_nonce, dek_ciphertext, dek_nonce, dek_plaintext, salt, kdf_time, kdf_memory, kdf_threads, kms_wrapped_dek, kms_key_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"),
+			id, sentinel, sentinelNonce, dekCT, dekNonce, dekPlain, salt, kdfTime, kdfMemory, kdfThreads, kmsWrapped, kmsKeyID, ts,
 		)
 		if err != nil {
 			return n, err
@@ -502,7 +502,7 @@ func copyVaultGrants(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDialect 
 
 func copyCredentials(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDialect Dialect) (int, error) {
 	rows, err := src.db.QueryContext(ctx,
-		"SELECT id, vault_id, key, type, ciphertext, nonce, created_at, updated_at FROM credentials")
+		"SELECT id, vault_id, key, type, ciphertext, nonce, version, created_at, updated_at FROM credentials")
 	if err != nil {
 		return 0, err
 	}
@@ -512,8 +512,9 @@ func copyCredentials(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDialect 
 	for rows.Next() {
 		var id, vaultID, key, typ string
 		var ct, nonce []byte
+		var version int64
 		var createdAt, updatedAt interface{}
-		if err := rows.Scan(&id, &vaultID, &key, &typ, &ct, &nonce, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&id, &vaultID, &key, &typ, &ct, &nonce, &version, &createdAt, &updatedAt); err != nil {
 			return n, err
 		}
 		ca, err := convertTime(createdAt, src.dialect, dstDialect)
@@ -525,8 +526,8 @@ func copyCredentials(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDialect 
 			return n, fmt.Errorf("converting updated_at: %w", err)
 		}
 		_, err = tx.ExecContext(ctx,
-			dstDialect.Rebind("INSERT INTO credentials (id, vault_id, key, type, ciphertext, nonce, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"),
-			id, vaultID, key, typ, ct, nonce, ca, ua,
+			dstDialect.Rebind("INSERT INTO credentials (id, vault_id, key, type, ciphertext, nonce, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"),
+			id, vaultID, key, typ, ct, nonce, version, ca, ua,
 		)
 		if err != nil {
 			return n, err
@@ -544,6 +545,7 @@ func copyCredentialOAuth(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDial
 		        refresh_token_ct, refresh_token_nonce,
 		        token_expires_at, connected_at, last_refreshed_at,
 		        last_refresh_error, last_refresh_error_at,
+		        version, client_secret_version,
 		        created_at, updated_at
 		 FROM credential_oauth`)
 	if err != nil {
@@ -562,6 +564,7 @@ func copyCredentialOAuth(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDial
 		var tokenExpiresAt, connectedAt, lastRefreshedAt interface{}
 		var lastRefreshError interface{}
 		var lastRefreshErrorAt interface{}
+		var version, csVersion int64
 		var createdAt, updatedAt interface{}
 
 		if err := rows.Scan(
@@ -571,6 +574,7 @@ func copyCredentialOAuth(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDial
 			&refreshCT, &refreshNonce,
 			&tokenExpiresAt, &connectedAt, &lastRefreshedAt,
 			&lastRefreshError, &lastRefreshErrorAt,
+			&version, &csVersion,
 			&createdAt, &updatedAt,
 		); err != nil {
 			return n, err
@@ -613,14 +617,16 @@ func copyCredentialOAuth(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDial
 				 refresh_token_ct, refresh_token_nonce,
 				 token_expires_at, connected_at, last_refreshed_at,
 				 last_refresh_error, last_refresh_error_at,
+				 version, client_secret_version,
 				 created_at, updated_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
 			vaultID, credKey, authURL, tokenURL, clientID,
 			clientSecretCT, clientSecretNonce, scopes, scopeSep,
 			boolVal, tokenAuthMethod,
 			refreshCT, refreshNonce,
 			tea, conna, lra,
 			lastRefreshError, lrea,
+			version, csVersion,
 			ca, ua,
 		)
 		if err != nil {
@@ -842,7 +848,7 @@ func copyProposals(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDialect Di
 
 func copyProposalCredentials(ctx context.Context, src *SQLStore, tx *sql.Tx, dstDialect Dialect) (int, error) {
 	rows, err := src.db.QueryContext(ctx,
-		"SELECT vault_id, proposal_id, key, ciphertext, nonce FROM proposal_credentials")
+		"SELECT vault_id, proposal_id, key, ciphertext, nonce, version FROM proposal_credentials")
 	if err != nil {
 		return 0, err
 	}
@@ -854,12 +860,13 @@ func copyProposalCredentials(ctx context.Context, src *SQLStore, tx *sql.Tx, dst
 		var proposalID int
 		var key string
 		var ct, nonce []byte
-		if err := rows.Scan(&vaultID, &proposalID, &key, &ct, &nonce); err != nil {
+		var version int64
+		if err := rows.Scan(&vaultID, &proposalID, &key, &ct, &nonce, &version); err != nil {
 			return n, err
 		}
 		_, err = tx.ExecContext(ctx,
-			dstDialect.Rebind("INSERT INTO proposal_credentials (vault_id, proposal_id, key, ciphertext, nonce) VALUES (?, ?, ?, ?, ?)"),
-			vaultID, proposalID, key, ct, nonce,
+			dstDialect.Rebind("INSERT INTO proposal_credentials (vault_id, proposal_id, key, ciphertext, nonce, version) VALUES (?, ?, ?, ?, ?, ?)"),
+			vaultID, proposalID, key, ct, nonce, version,
 		)
 		if err != nil {
 			return n, err

@@ -145,6 +145,10 @@ var serverCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if err := runAADMigration(db, masterKey.Key()); err != nil {
+			masterKey.Wipe()
+			return err
+		}
 
 		// Check if owner account exists; create interactively if possible.
 		ctx := context.Background()
@@ -342,6 +346,12 @@ func promptOwnerSetup(cmd *cobra.Command, db store.Store, masterPassword []byte)
 // Priority: AGENT_VAULT_MASTER_PASSWORD envvar > --password-stdin > interactive prompt.
 // When no password is provided (envvar empty, no --password-stdin), sets up in passwordless mode.
 func unlockOrSetup(cmd *cobra.Command, db store.Store, passwordStdin bool) (*auth.MasterKey, error) {
+	// 0. KMS mode (AGENT_VAULT_KMS_KEY_ID / AGENT_VAULT_REQUIRE_KMS): the DEK
+	// is wrapped by KMS and no other path is tried.
+	if mk, handled, err := unlockOrSetupKMS(db); handled {
+		return mk, err
+	}
+
 	// 1. AGENT_VAULT_MASTER_PASSWORD envvar (highest priority, for containerized/cloud deployments)
 	if envPw := os.Getenv("AGENT_VAULT_MASTER_PASSWORD"); envPw != "" {
 		_ = os.Unsetenv("AGENT_VAULT_MASTER_PASSWORD")
@@ -379,8 +389,7 @@ func unlockOrSetup(cmd *cobra.Command, db store.Store, passwordStdin bool) (*aut
 
 	// Existing record — check if passwordless
 	if record.DEKPlaintext != nil {
-		verRec := buildVerificationRecord(record)
-		mk, err := auth.UnlockPasswordless(verRec)
+		mk, err := unlockPasswordlessWithUpgrade(db, record)
 		if err != nil {
 			return nil, fmt.Errorf("unlocking (passwordless): %w", err)
 		}
@@ -388,7 +397,6 @@ func unlockOrSetup(cmd *cobra.Command, db store.Store, passwordStdin bool) (*aut
 	}
 
 	// Password-protected — interactive unlock, up to 3 attempts
-	verRec := buildVerificationRecord(record)
 	fmt.Fprintln(cmd.OutOrStderr(), boldText("Agent Vault is locked. Enter master password to unlock."))
 
 	for attempt := 1; attempt <= maxPasswordAttempts; attempt++ {
@@ -397,7 +405,7 @@ func unlockOrSetup(cmd *cobra.Command, db store.Store, passwordStdin bool) (*aut
 			return nil, fmt.Errorf("password input: %w", err)
 		}
 
-		mk, err := auth.Unlock(password, verRec)
+		mk, err := unlockPasswordWithUpgrade(db, password, record)
 		crypto.WipeBytes(password)
 		if err == nil {
 			return mk, nil
@@ -416,6 +424,14 @@ func unlockOrSetup(cmd *cobra.Command, db store.Store, passwordStdin bool) (*aut
 // unlockOrSetupWithPassword resolves the DEK using a known password (no prompting, no retry).
 // Used by the AGENT_VAULT_MASTER_PASSWORD envvar and --password-stdin code paths.
 func unlockOrSetupWithPassword(db store.Store, password []byte) (*auth.MasterKey, error) {
+	if err := refuseIfKMSRequired(); err != nil {
+		crypto.WipeBytes(password)
+		return nil, err
+	}
+	if mk, handled, err := unlockOrSetupKMS(db); handled {
+		crypto.WipeBytes(password)
+		return mk, err
+	}
 	ctx := context.Background()
 	record, err := db.GetMasterKeyRecord(ctx)
 	if err != nil {
@@ -429,8 +445,7 @@ func unlockOrSetupWithPassword(db store.Store, password []byte) (*auth.MasterKey
 	// Passwordless instance — password is ignored, unlock without it
 	if record.DEKPlaintext != nil {
 		crypto.WipeBytes(password)
-		verRec := buildVerificationRecord(record)
-		mk, err := auth.UnlockPasswordless(verRec)
+		mk, err := unlockPasswordlessWithUpgrade(db, record)
 		if err != nil {
 			return nil, fmt.Errorf("unlocking (passwordless): %w", err)
 		}
@@ -438,8 +453,7 @@ func unlockOrSetupWithPassword(db store.Store, password []byte) (*auth.MasterKey
 	}
 
 	// Password-protected — single attempt, no retry
-	verRec := buildVerificationRecord(record)
-	mk, err := auth.Unlock(password, verRec)
+	mk, err := unlockPasswordWithUpgrade(db, password, record)
 	crypto.WipeBytes(password)
 	if err != nil {
 		return nil, fmt.Errorf("wrong password")
@@ -455,6 +469,10 @@ func unlockOrSetupWithPassword(db store.Store, password []byte) (*auth.MasterKey
 // record already exists, we re-read it and unlock using the existing
 // record instead of the locally-generated one.
 func setupMasterKey(db store.Store, password []byte) (*auth.MasterKey, error) {
+	if err := refuseIfKMSRequired(); err != nil {
+		crypto.WipeBytes(password)
+		return nil, err
+	}
 	var mk *auth.MasterKey
 	var rec *auth.VerificationRecord
 	var err error
@@ -528,6 +546,8 @@ func verificationToStoreRecord(rec *auth.VerificationRecord) *store.MasterKeyRec
 		DEKNonce:      rec.DEKNonce,
 		DEKPlaintext:  rec.DEKPlaintext,
 		Salt:          rec.Salt,
+		KMSWrappedDEK: rec.KMSWrappedDEK,
+		KMSKeyID:      rec.KMSKeyID,
 	}
 	if rec.Params.Time > 0 {
 		r.KDFTime = &rec.Params.Time
@@ -546,6 +566,8 @@ func buildVerificationRecord(record *store.MasterKeyRecord) *auth.VerificationRe
 		DEKNonce:      record.DEKNonce,
 		DEKPlaintext:  record.DEKPlaintext,
 		Salt:          record.Salt,
+		KMSWrappedDEK: record.KMSWrappedDEK,
+		KMSKeyID:      record.KMSKeyID,
 	}
 	if record.KDFTime != nil {
 		defaults := crypto.DefaultKDFParams()

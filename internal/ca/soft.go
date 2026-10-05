@@ -149,11 +149,11 @@ func New(masterKey []byte, opts Options) (*SoftCA, error) {
 
 	dir := opts.Dir
 	if dir == "" {
-		home, err := os.UserHomeDir()
+		d, err := DefaultDir()
 		if err != nil {
-			return nil, fmt.Errorf("resolving home dir: %w", err)
+			return nil, err
 		}
-		dir = filepath.Join(home, ".agent-vault", defaultDirName)
+		dir = d
 	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("creating ca dir: %w", err)
@@ -229,7 +229,7 @@ func (c *SoftCA) loadFromRecord(state *CAStateRecord, masterKey []byte) error {
 		return fmt.Errorf("parsing root cert from database: %w", err)
 	}
 
-	keyDER, err := crypto.Decrypt(state.RootKeyCT, state.RootKeyNonce, masterKey)
+	keyDER, err := RootKeyAAD.Open(state.RootKeyCT, state.RootKeyNonce, masterKey)
 	if err != nil {
 		return fmt.Errorf("decrypting root key from database: %w", err)
 	}
@@ -273,7 +273,7 @@ func (c *SoftCA) generateMaterials(masterKey []byte) ([]byte, []byte, []byte, er
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("marshaling root key: %w", err)
 	}
-	ciphertext, nonce, err := crypto.Encrypt(keyDER, masterKey)
+	ciphertext, nonce, err := RootKeyAAD.Seal(keyDER, masterKey)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("encrypting root key: %w", err)
 	}
@@ -311,7 +311,7 @@ func (c *SoftCA) load(certPath, keyPath string, masterKey []byte) error {
 	if err != nil {
 		return fmt.Errorf("decoding ciphertext: %w", err)
 	}
-	keyDER, err := crypto.Decrypt(ciphertext, nonce, masterKey)
+	keyDER, err := RootKeyAAD.Open(ciphertext, nonce, masterKey)
 	if err != nil {
 		return fmt.Errorf("decrypting root key: %w", err)
 	}
@@ -360,7 +360,7 @@ func (c *SoftCA) generate(certPath, keyPath string, masterKey []byte) error {
 	if err != nil {
 		return fmt.Errorf("marshaling root key: %w", err)
 	}
-	ciphertext, nonce, err := crypto.Encrypt(keyDER, masterKey)
+	ciphertext, nonce, err := RootKeyAAD.Seal(keyDER, masterKey)
 	if err != nil {
 		return fmt.Errorf("encrypting root key: %w", err)
 	}
@@ -519,3 +519,82 @@ func writeAtomic(path string, data []byte, mode os.FileMode) error {
 }
 
 var _ Provider = (*SoftCA)(nil)
+
+// RootKeyAAD binds the CA root private key ciphertext (ca.key.enc on disk,
+// ca_state.root_key_ct in the database) to its role, so no other
+// DEK-encrypted value (for example a credential written through the API)
+// can stand in for it. The CA key is never rewritten in place, so its
+// version is constant.
+var RootKeyAAD = crypto.AAD{Table: "ca_root_key", Field: "root_key", Version: 1}
+
+// RewrapLegacyRootKey converts a v0.40.0 (nil-AAD) root key ciphertext to the
+// AAD-bound form. bound reports that the input was already AAD-bound (and is
+// returned unchanged). A value that opens neither way is an error.
+func RewrapLegacyRootKey(ciphertext, nonce, masterKey []byte) (newCT, newNonce []byte, bound bool, err error) {
+	if _, err := RootKeyAAD.Open(ciphertext, nonce, masterKey); err == nil {
+		return ciphertext, nonce, true, nil
+	}
+	keyDER, err := crypto.Decrypt(ciphertext, nonce, masterKey)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("CA root key opens neither as AAD-bound nor as legacy: %w", err)
+	}
+	defer crypto.WipeBytes(keyDER)
+	if _, err := x509.ParseECPrivateKey(keyDER); err != nil {
+		return nil, nil, false, fmt.Errorf("legacy CA root key does not parse: %w", err)
+	}
+	newCT, newNonce, err = RootKeyAAD.Seal(keyDER, masterKey)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return newCT, newNonce, false, nil
+}
+
+// MigrateKeyFile rewrites the file-backed root key in dir (ca.key.enc) from
+// the legacy nil-AAD form to the AAD-bound form. A missing key file is a
+// no-op; an already bound file is left untouched.
+func MigrateKeyFile(dir string, masterKey []byte) error {
+	keyPath := filepath.Join(dir, rootKeyFile)
+	raw, err := os.ReadFile(keyPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading root key: %w", err)
+	}
+	var enc encryptedKeyFile
+	if err := json.Unmarshal(raw, &enc); err != nil {
+		return fmt.Errorf("parsing root key file: %w", err)
+	}
+	nonce, err := base64.StdEncoding.DecodeString(enc.Nonce)
+	if err != nil {
+		return fmt.Errorf("decoding nonce: %w", err)
+	}
+	ciphertext, err := base64.StdEncoding.DecodeString(enc.Ciphertext)
+	if err != nil {
+		return fmt.Errorf("decoding ciphertext: %w", err)
+	}
+	newCT, newNonce, bound, err := RewrapLegacyRootKey(ciphertext, nonce, masterKey)
+	if err != nil {
+		return err
+	}
+	if bound {
+		return nil
+	}
+	blob, err := json.Marshal(encryptedKeyFile{
+		Nonce:      base64.StdEncoding.EncodeToString(newNonce),
+		Ciphertext: base64.StdEncoding.EncodeToString(newCT),
+	})
+	if err != nil {
+		return fmt.Errorf("marshaling encrypted key: %w", err)
+	}
+	return writeAtomic(keyPath, blob, 0600)
+}
+
+// DefaultDir is the directory of the file-backed CA (~/.agent-vault/ca).
+func DefaultDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolving home dir: %w", err)
+	}
+	return filepath.Join(home, ".agent-vault", defaultDirName), nil
+}

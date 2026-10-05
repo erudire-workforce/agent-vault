@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // Runtime tests for KMS-wrapped DEK startup on the SQLite store, driven
 // through the real unlock entry points in cmd/server.go (unlockOrSetup,
 // unlockOrSetupWithPassword). They compile against v0.40.0 and fail at

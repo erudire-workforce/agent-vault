@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/Infisical/agent-vault/internal/broker"
-	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/store"
 )
 
@@ -71,7 +70,7 @@ func make32(b byte) []byte {
 
 func (f *fakeCredStore) setCred(t *testing.T, key32 []byte, vaultID, key, plaintext string) {
 	t.Helper()
-	ct, nonce, err := crypto.Encrypt([]byte(plaintext), key32)
+	ct, nonce, err := store.CredentialValueAAD(vaultID, key, 0).Seal([]byte(plaintext), key32)
 	if err != nil {
 		t.Fatalf("encrypt: %v", err)
 	}

@@ -4,7 +4,8 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    # claude/** : fork work branches get the full suite before a PR exists.
+    branches: [main, 'claude/**']
 
 permissions:
   contents: read
@@ -78,6 +79,23 @@ jobs:
   # too large a failure mode for the speedup it would buy.
   go-test:
     runs-on: ubuntu-latest
+    # Store-backed tests run once per backend; Postgres is the deployment
+    # target, so a missing database must fail the run, not skip it.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      AGENT_VAULT_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+      AGENT_VAULT_TEST_REQUIRE_POSTGRES: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -98,6 +116,15 @@ jobs:
 
       - name: Run tests
         run: go test -race -count=1 ./...
+
+      # internal/server's kmsaad files stay behind the build tag because
+      # kmsaad_policy_test.go also holds the proxy whoami test, whose feature
+      # ships separately. The tests whose features are implemented run here
+      # by name; drop this step when the tag is removed from that package.
+      - name: Run tagged server tests (implemented features)
+        run: >-
+          go test -race -count=1 -tags kmsaad ./internal/server
+          -run 'TestKMSAAD_(API_|WriteOnly_|RegisterRefusedOnceAUserExists|RequireTokenExpiry_|CredentialStoreSwitchingDisabled|NoSecretInLogs_|LogScanner_KnownPositive|ExecutorTokenPrivilegeChecks)'
 
   # Security-critical: always run on every PR (see go-test for rationale).
   go-lint:

@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // Package aadmigrate does not exist at v0.40.0. These tests pin the one-time
 // migration of legacy (nil-AAD) ciphertexts to row-bound AAD on the SQLite
 // store. Until the package is written they fail to compile with

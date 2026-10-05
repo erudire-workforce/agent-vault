@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // Runtime tests: the CA root private key is sealed with nil AAD
 // (soft.go:276/363), so any DEK ciphertext of an EC key DER can replace it.
 // An API caller can obtain such a ciphertext from the credential write path

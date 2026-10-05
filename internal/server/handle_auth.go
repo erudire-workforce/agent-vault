@@ -85,17 +85,13 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Check domain and invite-only restrictions (skip for first user — owner can set any email).
-	userCount, _ := s.store.CountUsers(ctx)
-	if userCount > 0 {
-		if msg := s.checkEmailDomain(ctx, req.Email); msg != "" {
-			jsonError(w, http.StatusForbidden, msg)
-			return
-		}
-		if s.isInviteOnly(ctx) {
-			jsonError(w, http.StatusForbidden, "This instance is invite-only; accounts can only be created through an invite")
-			return
-		}
+	// Open registration only bootstraps the first (owner) account. Once any
+	// user exists, accounts are created through invites only; a count error
+	// fails closed.
+	userCount, err := s.store.CountUsers(ctx)
+	if err != nil || userCount > 0 {
+		jsonError(w, http.StatusForbidden, "Registration is closed; accounts can only be created through an invite")
+		return
 	}
 
 	// Check if email is already taken.

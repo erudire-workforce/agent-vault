@@ -298,6 +298,7 @@ type Store interface {
 
 	// Credentials
 	SetCredential(ctx context.Context, vaultID, key string, ciphertext, nonce []byte) (*store.Credential, error)
+	SetCredentialVersion(ctx context.Context, vaultID, key string, ciphertext, nonce []byte, version uint64) (*store.Credential, error)
 	GetCredential(ctx context.Context, vaultID, key string) (*store.Credential, error)
 	ListCredentials(ctx context.Context, vaultID string) ([]store.Credential, error)
 	DeleteCredential(ctx context.Context, vaultID, key string) error
@@ -319,7 +320,7 @@ type Store interface {
 	SetBrokerConfig(ctx context.Context, vaultID, servicesJSON string) (*store.BrokerConfig, error)
 
 	// Proposals
-	CreateProposal(ctx context.Context, vaultID, sessionID, servicesJSON, credentialsJSON, message, userMessage string, credentials map[string]store.EncryptedCredential) (*store.Proposal, error)
+	CreateProposalWithSealer(ctx context.Context, vaultID, sessionID, servicesJSON, credentialsJSON, message, userMessage string, seal func(proposalID int) (map[string]store.EncryptedCredential, error)) (*store.Proposal, error)
 	GetProposal(ctx context.Context, vaultID string, id int) (*store.Proposal, error)
 	GetProposalByApprovalToken(ctx context.Context, token string) (*store.Proposal, error)
 	ListProposals(ctx context.Context, vaultID, status string) ([]store.Proposal, error)

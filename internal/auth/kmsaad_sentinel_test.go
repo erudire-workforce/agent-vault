@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // Runtime tests: the DEK sentinel (auth.go:96) and the password-KEK wrap of
 // the DEK (auth.go:149) are sealed with nil AAD at v0.40.0. Any other
 // DEK-encrypted blob of the right plaintext can then stand in for the

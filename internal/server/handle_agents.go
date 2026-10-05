@@ -112,6 +112,10 @@ func (s *Server) handleAgentCreate(w http.ResponseWriter, r *http.Request) {
 		grantSpecs = append(grantSpecs, store.AgentVaultGrantSpec{VaultID: v.VaultID, Role: v.VaultRole})
 		vaultInfos = append(vaultInfos, agentVaultJSON{VaultName: v.VaultName, VaultRole: v.VaultRole})
 	}
+	if store.TokenExpiryRequired() {
+		jsonError(w, http.StatusBadRequest, tokenExpiryRequiredMsg)
+		return
+	}
 	agent, sess, err := s.store.CreateAgentWithGrantsAndToken(ctx, req.Name, actor.ID, agentRole, grantSpecs, nil)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -324,6 +328,12 @@ func (s *Server) handleAgentDelete(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"message": fmt.Sprintf("agent %q deleted", name)})
 }
 
+// tokenExpiryRequiredMsg is returned when a mint would produce a token with
+// no expiry while AGENT_VAULT_REQUIRE_TOKEN_EXPIRY=1. The API mints agent
+// tokens without an expiry, so under that setting agent tokens come only
+// from a path that sets one (declarative bootstrap).
+const tokenExpiryRequiredMsg = "Tokens without an expiry are refused on this instance (AGENT_VAULT_REQUIRE_TOKEN_EXPIRY=1)"
+
 // handleAgentRotate invalidates the agent's existing tokens and mints a new one.
 func (s *Server) handleAgentRotate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -349,6 +359,10 @@ func (s *Server) handleAgentRotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if store.TokenExpiryRequired() {
+		jsonError(w, http.StatusBadRequest, tokenExpiryRequiredMsg)
+		return
+	}
 	sess, err := s.store.RotateAgentToken(ctx, agent.ID, nil)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "Failed to rotate agent token")

@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // Runtime tests for row-bound AAD on the OAuth refresh path
 // (brokercore/credential.go maybeRefreshOAuth). They compile against v0.40.0
 // and fail at runtime: the refresh path decrypts refresh_token_ct and
@@ -51,12 +49,17 @@ func (f *fakeOAuthStore) GetCredentialOAuth(_ context.Context, vaultID, key stri
 func (f *fakeOAuthStore) UpdateCredentialOAuthTokens(_ context.Context, vaultID, key string, accessCT, accessNonce, refreshCT, refreshNonce []byte, expiresAt *time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Mirrors the SQL store: every access-token write bumps
+	// credentials.version and every refresh-token write bumps
+	// credential_oauth.version (the versions are bound into the AAD).
 	if c, ok := f.creds.creds[vaultID+"|"+key]; ok {
 		c.Ciphertext, c.Nonce = accessCT, accessNonce
+		c.Version++
 	}
 	if r, ok := f.rows[vaultID+"|"+key]; ok {
 		if refreshCT != nil {
 			r.RefreshTokenCT, r.RefreshTokenNonce = refreshCT, refreshNonce
+			r.Version++
 		}
 		r.TokenExpiresAt = expiresAt
 	}
@@ -115,9 +118,13 @@ func (r *tokenRecorder) saw(s string) bool {
 	return false
 }
 
-func encOAuthField(t *testing.T, k []byte, value string) ([]byte, []byte) {
+func encOAuthField(t *testing.T, k []byte, field, vaultID, key string, version uint64, value string) ([]byte, []byte) {
 	t.Helper()
-	ct, n, err := crypto.Encrypt([]byte(value), k)
+	aad, err := crypto.AAD{Table: "credential_oauth", Field: field, VaultID: vaultID, Key: key, Version: version}.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct, n, err := crypto.EncryptAAD([]byte(value), k, aad)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,8 +153,8 @@ func (fx *oauthFixture) addExpiredOAuth(t *testing.T, vaultID, key, host, tokenU
 	t.Helper()
 	fx.creds.setCred(t, fx.k, vaultID, key, "stale-access-"+key)
 	fx.creds.creds[vaultID+"|"+key].Type = "oauth"
-	rCT, rN := encOAuthField(t, fx.k, refresh)
-	csCT, csN := encOAuthField(t, fx.k, clientSecret)
+	rCT, rN := encOAuthField(t, fx.k, "refresh_token", vaultID, key, 0, refresh)
+	csCT, csN := encOAuthField(t, fx.k, "client_secret", vaultID, key, 0, clientSecret)
 	exp := time.Now().Add(-time.Minute)
 	fx.oa.rows[vaultID+"|"+key] = &store.CredentialOAuth{
 		VaultID: vaultID, CredentialKey: key, TokenURL: tokenURL, ClientID: "cid-" + key,

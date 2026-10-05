@@ -858,33 +858,78 @@ func (s *SQLStore) RenameVault(ctx context.Context, oldName string, newName stri
 // --- Credentials ---
 
 func (s *SQLStore) SetCredential(ctx context.Context, vaultID, key string, ciphertext, nonce []byte) (*Credential, error) {
-	id := newUUID()
 	now := time.Now().UTC()
 	nowStr := s.dialect.FormatTime(now)
 
-	_, err := s.db.ExecContext(ctx,
-		s.dialect.Rebind(`INSERT INTO credentials (id, vault_id, key, type, ciphertext, nonce, created_at, updated_at)
-		 VALUES (?, ?, ?, 'static', ?, ?, ?, ?)
+	// version is bumped on every write; the caller that wants the value to be
+	// readable through the AAD path seals it for (current version + 1), or
+	// uses SetCredentialVersion for a compare-and-set write.
+	// A nil value (an OAuth slot with no access token yet) is stored as an
+	// empty blob, like the parent row SetCredentialOAuth creates.
+	if ciphertext == nil {
+		ciphertext = []byte{}
+	}
+	if nonce == nil {
+		nonce = []byte{}
+	}
+	row := s.db.QueryRowContext(ctx,
+		s.dialect.Rebind(`INSERT INTO credentials (id, vault_id, key, type, ciphertext, nonce, version, created_at, updated_at)
+		 VALUES (?, ?, ?, 'static', ?, ?, 1, ?, ?)
 		 ON CONFLICT(vault_id, key) DO UPDATE SET
 		   ciphertext = excluded.ciphertext,
 		   nonce = excluded.nonce,
-		   updated_at = excluded.updated_at`),
-		id, vaultID, key, ciphertext, nonce, nowStr, nowStr,
+		   version = credentials.version + 1,
+		   updated_at = excluded.updated_at
+		 RETURNING id, type, version, created_at`),
+		newUUID(), vaultID, key, ciphertext, nonce, nowStr, nowStr,
+	)
+	cred := &Credential{VaultID: vaultID, Key: key, Ciphertext: ciphertext, Nonce: nonce, UpdatedAt: now}
+	var createdAt interface{}
+	if err := row.Scan(&cred.ID, &cred.Type, &cred.Version, &createdAt); err != nil {
+		return nil, fmt.Errorf("setting credential: %w", err)
+	}
+	cred.CreatedAt, _ = s.dialect.ScanTime(createdAt)
+	return cred, nil
+}
+
+// ErrVersionConflict is returned by the compare-and-set writers when the row
+// changed between the caller's read and its write.
+var ErrVersionConflict = errors.New("store: row version changed concurrently")
+
+// SetCredentialVersion writes a ciphertext sealed for version. It succeeds
+// only when the row is absent or its current version is version-1, so a
+// value sealed for a stale version is never stored.
+func (s *SQLStore) SetCredentialVersion(ctx context.Context, vaultID, key string, ciphertext, nonce []byte, version uint64) (*Credential, error) {
+	if version == 0 {
+		return nil, fmt.Errorf("setting credential: version must be > 0")
+	}
+	now := time.Now().UTC()
+	nowStr := s.dialect.FormatTime(now)
+	res, err := s.db.ExecContext(ctx,
+		s.dialect.Rebind(`INSERT INTO credentials (id, vault_id, key, type, ciphertext, nonce, version, created_at, updated_at)
+		 VALUES (?, ?, ?, 'static', ?, ?, ?, ?, ?)
+		 ON CONFLICT(vault_id, key) DO UPDATE SET
+		   ciphertext = excluded.ciphertext,
+		   nonce = excluded.nonce,
+		   version = excluded.version,
+		   updated_at = excluded.updated_at
+		 WHERE credentials.version = ?`),
+		newUUID(), vaultID, key, ciphertext, nonce, int64(version), nowStr, nowStr, int64(version-1),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("setting credential: %w", err)
 	}
-
-	return &Credential{
-		ID: id, VaultID: vaultID, Key: key, Type: "static",
-		Ciphertext: ciphertext, Nonce: nonce,
-		CreatedAt: now, UpdatedAt: now,
-	}, nil
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, ErrVersionConflict
+	}
+	return s.GetCredential(ctx, vaultID, key)
 }
+
+const credentialColumns = "id, vault_id, key, type, ciphertext, nonce, version, created_at, updated_at"
 
 func (s *SQLStore) GetCredential(ctx context.Context, vaultID, key string) (*Credential, error) {
 	row := s.db.QueryRowContext(ctx,
-		s.dialect.Rebind("SELECT id, vault_id, key, type, ciphertext, nonce, created_at, updated_at FROM credentials WHERE vault_id = ? AND key = ?"),
+		s.dialect.Rebind("SELECT "+credentialColumns+" FROM credentials WHERE vault_id = ? AND key = ?"),
 		vaultID, key,
 	)
 	return s.scanCredential(row)
@@ -892,7 +937,7 @@ func (s *SQLStore) GetCredential(ctx context.Context, vaultID, key string) (*Cre
 
 func (s *SQLStore) ListCredentials(ctx context.Context, vaultID string) ([]Credential, error) {
 	rows, err := s.db.QueryContext(ctx,
-		s.dialect.Rebind("SELECT id, vault_id, key, type, ciphertext, nonce, created_at, updated_at FROM credentials WHERE vault_id = ? ORDER BY key"),
+		s.dialect.Rebind("SELECT "+credentialColumns+" FROM credentials WHERE vault_id = ? ORDER BY key"),
 		vaultID,
 	)
 	if err != nil {
@@ -904,7 +949,7 @@ func (s *SQLStore) ListCredentials(ctx context.Context, vaultID string) ([]Crede
 	for rows.Next() {
 		var cred Credential
 		var createdAt, updatedAt interface{}
-		if err := rows.Scan(&cred.ID, &cred.VaultID, &cred.Key, &cred.Type, &cred.Ciphertext, &cred.Nonce, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&cred.ID, &cred.VaultID, &cred.Key, &cred.Type, &cred.Ciphertext, &cred.Nonce, &cred.Version, &createdAt, &updatedAt); err != nil {
 			return nil, fmt.Errorf("scanning credential: %w", err)
 		}
 		cred.CreatedAt, _ = s.dialect.ScanTime(createdAt)
@@ -941,7 +986,7 @@ func (s *SQLStore) GetCredentialOAuth(ctx context.Context, vaultID, key string) 
 		   client_secret_ct, client_secret_nonce, scopes, scope_separator, disable_pkce,
 		   token_auth_method, refresh_token_ct, refresh_token_nonce, token_expires_at,
 		   connected_at, last_refreshed_at, last_refresh_error, last_refresh_error_at,
-		   created_at, updated_at
+		   version, client_secret_version, created_at, updated_at
 		 FROM credential_oauth WHERE vault_id = ? AND credential_key = ?`),
 		vaultID, key,
 	).Scan(
@@ -949,7 +994,7 @@ func (s *SQLStore) GetCredentialOAuth(ctx context.Context, vaultID, key string) 
 		&co.ClientSecretCT, &co.ClientSecretNonce, &scopes, &scopeSep, &disablePKCERaw,
 		&tokenAuthMethod, &co.RefreshTokenCT, &co.RefreshTokenNonce, &tokenExpiresAt,
 		&connectedAt, &lastRefreshedAt, &lastRefreshError, &lastRefreshErrorAt,
-		&createdAt, &updatedAt,
+		&co.Version, &co.ClientSecretVersion, &createdAt, &updatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -1017,14 +1062,20 @@ func (s *SQLStore) SetCredentialOAuth(ctx context.Context, co *CredentialOAuth) 
 		   client_secret_ct, client_secret_nonce, scopes, scope_separator, disable_pkce, token_auth_method,
 		   refresh_token_ct, refresh_token_nonce, token_expires_at,
 		   connected_at, last_refreshed_at, last_refresh_error, last_refresh_error_at,
-		   created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		   version, client_secret_version, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(vault_id, credential_key) DO UPDATE SET
 		   authorization_url = excluded.authorization_url,
 		   token_url = excluded.token_url,
 		   client_id = excluded.client_id,
 		   client_secret_ct = excluded.client_secret_ct,
 		   client_secret_nonce = excluded.client_secret_nonce,
+		   client_secret_version = CASE WHEN excluded.client_secret_ct IS NOT NULL
+		     THEN credential_oauth.client_secret_version + 1
+		     ELSE credential_oauth.client_secret_version END,
+		   version = CASE WHEN excluded.refresh_token_ct IS NOT NULL
+		     THEN credential_oauth.version + 1
+		     ELSE credential_oauth.version END,
 		   scopes = excluded.scopes,
 		   scope_separator = excluded.scope_separator,
 		   disable_pkce = excluded.disable_pkce,
@@ -1051,7 +1102,7 @@ func (s *SQLStore) SetCredentialOAuth(ctx context.Context, co *CredentialOAuth) 
 		co.ClientSecretCT, co.ClientSecretNonce, nullableString(co.Scopes), scopeSep, disablePKCE, tokenAuthMethod,
 		co.RefreshTokenCT, co.RefreshTokenNonce, tokenExpiresAt,
 		connectedAt, lastRefreshedAt, nullableString(co.LastRefreshError), lastRefreshErrorAt,
-		nowStr, nowStr,
+		versionIfSet(co.RefreshTokenCT), versionIfSet(co.ClientSecretCT), nowStr, nowStr,
 	)
 	if err != nil {
 		return err
@@ -1070,7 +1121,7 @@ func (s *SQLStore) UpdateCredentialOAuthTokens(ctx context.Context, vaultID, key
 
 	// Update the access token in the credentials table.
 	_, err = tx.ExecContext(ctx,
-		s.dialect.Rebind(`UPDATE credentials SET ciphertext = ?, nonce = ?, updated_at = ?
+		s.dialect.Rebind(`UPDATE credentials SET ciphertext = ?, nonce = ?, version = version + 1, updated_at = ?
 		 WHERE vault_id = ? AND key = ?`),
 		accessCT, accessNonce, nowStr, vaultID, key,
 	)
@@ -1084,7 +1135,7 @@ func (s *SQLStore) UpdateCredentialOAuthTokens(ctx context.Context, vaultID, key
 	if refreshCT != nil {
 		_, err = tx.ExecContext(ctx,
 			s.dialect.Rebind(`UPDATE credential_oauth SET
-			   refresh_token_ct = ?, refresh_token_nonce = ?,
+			   refresh_token_ct = ?, refresh_token_nonce = ?, version = version + 1,
 			   token_expires_at = ?, connected_at = COALESCE(connected_at, ?),
 			   last_refreshed_at = ?, last_refresh_error = NULL, last_refresh_error_at = NULL,
 			   updated_at = ?
@@ -1880,16 +1931,18 @@ func (s *SQLStore) DeleteSession(ctx context.Context, rawToken string) error {
 func (s *SQLStore) GetMasterKeyRecord(ctx context.Context) (*MasterKeyRecord, error) {
 	row := s.db.QueryRowContext(ctx,
 		s.dialect.Rebind(`SELECT sentinel, sentinel_nonce, dek_ciphertext, dek_nonce, dek_plaintext,
-		        salt, kdf_time, kdf_memory, kdf_threads, created_at
+		        salt, kdf_time, kdf_memory, kdf_threads, kms_wrapped_dek, kms_key_id, created_at
 		 FROM master_key WHERE id = 1`),
 	)
 
 	var rec MasterKeyRecord
 	var createdAt interface{}
+	var kmsKeyID sql.NullString
 	err := row.Scan(
 		&rec.Sentinel, &rec.SentinelNonce,
 		&rec.DEKCiphertext, &rec.DEKNonce, &rec.DEKPlaintext,
 		&rec.Salt, &rec.KDFTime, &rec.KDFMemory, &rec.KDFThreads,
+		&rec.KMSWrappedDEK, &kmsKeyID,
 		&createdAt,
 	)
 	if err == sql.ErrNoRows {
@@ -1898,18 +1951,20 @@ func (s *SQLStore) GetMasterKeyRecord(ctx context.Context) (*MasterKeyRecord, er
 	if err != nil {
 		return nil, fmt.Errorf("getting master key record: %w", err)
 	}
+	rec.KMSKeyID = kmsKeyID.String
 	rec.CreatedAt, _ = s.dialect.ScanTime(createdAt)
 	return &rec, nil
 }
 
 func (s *SQLStore) SetMasterKeyRecord(ctx context.Context, record *MasterKeyRecord) error {
 	_, err := s.db.ExecContext(ctx,
-		s.dialect.Rebind(`INSERT INTO master_key (id, sentinel, sentinel_nonce, dek_ciphertext, dek_nonce, dek_plaintext, salt, kdf_time, kdf_memory, kdf_threads)
-		 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		s.dialect.Rebind(`INSERT INTO master_key (id, sentinel, sentinel_nonce, dek_ciphertext, dek_nonce, dek_plaintext, salt, kdf_time, kdf_memory, kdf_threads, kms_wrapped_dek, kms_key_id)
+		 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO NOTHING`),
 		record.Sentinel, record.SentinelNonce,
 		record.DEKCiphertext, record.DEKNonce, record.DEKPlaintext,
 		record.Salt, record.KDFTime, record.KDFMemory, record.KDFThreads,
+		record.KMSWrappedDEK, nullableString(record.KMSKeyID),
 	)
 	if err != nil {
 		return fmt.Errorf("setting master key record: %w", err)
@@ -1922,11 +1977,13 @@ func (s *SQLStore) UpdateMasterKeyRecord(ctx context.Context, record *MasterKeyR
 		s.dialect.Rebind(`UPDATE master_key SET
 		    sentinel = ?, sentinel_nonce = ?,
 		    dek_ciphertext = ?, dek_nonce = ?, dek_plaintext = ?,
-		    salt = ?, kdf_time = ?, kdf_memory = ?, kdf_threads = ?
+		    salt = ?, kdf_time = ?, kdf_memory = ?, kdf_threads = ?,
+		    kms_wrapped_dek = ?, kms_key_id = ?
 		 WHERE id = 1`),
 		record.Sentinel, record.SentinelNonce,
 		record.DEKCiphertext, record.DEKNonce, record.DEKPlaintext,
 		record.Salt, record.KDFTime, record.KDFMemory, record.KDFThreads,
+		record.KMSWrappedDEK, nullableString(record.KMSKeyID),
 	)
 	if err != nil {
 		return fmt.Errorf("updating master key record: %w", err)
@@ -1987,6 +2044,16 @@ func newPrefixedToken(prefix string) string {
 func newApprovalToken() string { return newPrefixedToken("av_appr_") }
 
 func (s *SQLStore) CreateProposal(ctx context.Context, vaultID, sessionID, servicesJSON, credentialsJSON, message, userMessage string, credentials map[string]EncryptedCredential) (*Proposal, error) {
+	return s.CreateProposalWithSealer(ctx, vaultID, sessionID, servicesJSON, credentialsJSON, message, userMessage,
+		func(int) (map[string]EncryptedCredential, error) { return credentials, nil })
+}
+
+// CreateProposalWithSealer creates a proposal and stores the credential
+// ciphertexts returned by seal, which is called inside the transaction with
+// the proposal's sequential id (the id is part of each value's AAD, so it
+// must be known before the values are sealed). Every proposal credential row
+// is written at version 1.
+func (s *SQLStore) CreateProposalWithSealer(ctx context.Context, vaultID, sessionID, servicesJSON, credentialsJSON, message, userMessage string, seal func(proposalID int) (map[string]EncryptedCredential, error)) (*Proposal, error) {
 	now := time.Now().UTC()
 	nowStr := s.dialect.FormatTime(now)
 	approvalToken := newApprovalToken()
@@ -2028,11 +2095,16 @@ func (s *SQLStore) CreateProposal(ctx context.Context, vaultID, sessionID, servi
 		return nil, fmt.Errorf("inserting proposal: %w", err)
 	}
 
+	credentials, err := seal(nextID)
+	if err != nil {
+		return nil, fmt.Errorf("sealing proposal credentials: %w", err)
+	}
+
 	// Store agent-provided encrypted credential values.
 	for key, enc := range credentials {
 		_, err = tx.ExecContext(ctx,
-			s.dialect.Rebind(`INSERT INTO proposal_credentials (vault_id, proposal_id, key, ciphertext, nonce)
-			 VALUES (?, ?, ?, ?, ?)`),
+			s.dialect.Rebind(`INSERT INTO proposal_credentials (vault_id, proposal_id, key, ciphertext, nonce, version)
+			 VALUES (?, ?, ?, ?, ?, 1)`),
 			vaultID, nextID, key, enc.Ciphertext, enc.Nonce,
 		)
 		if err != nil {
@@ -2146,7 +2218,7 @@ func (s *SQLStore) ExpirePendingProposals(ctx context.Context, before time.Time)
 
 func (s *SQLStore) GetProposalCredentials(ctx context.Context, vaultID string, proposalID int) (map[string]EncryptedCredential, error) {
 	rows, err := s.db.QueryContext(ctx,
-		s.dialect.Rebind("SELECT key, ciphertext, nonce FROM proposal_credentials WHERE vault_id = ? AND proposal_id = ?"),
+		s.dialect.Rebind("SELECT key, ciphertext, nonce, version FROM proposal_credentials WHERE vault_id = ? AND proposal_id = ?"),
 		vaultID, proposalID,
 	)
 	if err != nil {
@@ -2158,10 +2230,11 @@ func (s *SQLStore) GetProposalCredentials(ctx context.Context, vaultID string, p
 	for rows.Next() {
 		var key string
 		var ct, nonce []byte
-		if err := rows.Scan(&key, &ct, &nonce); err != nil {
+		var version uint64
+		if err := rows.Scan(&key, &ct, &nonce, &version); err != nil {
 			return nil, fmt.Errorf("scanning proposal credential: %w", err)
 		}
-		creds[key] = EncryptedCredential{Ciphertext: ct, Nonce: nonce}
+		creds[key] = EncryptedCredential{Ciphertext: ct, Nonce: nonce, Version: version}
 	}
 	return creds, rows.Err()
 }
@@ -2184,20 +2257,44 @@ func (s *SQLStore) ApplyProposal(ctx context.Context, vaultID string, proposalID
 		return fmt.Errorf("updating broker config: %w", err)
 	}
 
-	// 2. Upsert each static credential.
+	// 2. Upsert each static credential. enc.Version is the version the value
+	// was sealed for; the write only lands if the row is absent or still at
+	// enc.Version-1 (compare-and-set), so a value sealed for a stale version
+	// is never stored. Version 0 means "no compare-and-set": the row version
+	// is bumped like SetCredential does.
 	for key, enc := range credentials {
+		if enc.Version == 0 {
+			if _, err := tx.ExecContext(ctx,
+				s.dialect.Rebind(`INSERT INTO credentials (id, vault_id, key, type, ciphertext, nonce, version, created_at, updated_at)
+				 VALUES (?, ?, ?, 'static', ?, ?, 1, ?, ?)
+				 ON CONFLICT(vault_id, key) DO UPDATE SET
+				   ciphertext = excluded.ciphertext,
+				   nonce = excluded.nonce,
+				   version = credentials.version + 1,
+				   updated_at = excluded.updated_at`),
+				newUUID(), vaultID, key, enc.Ciphertext, enc.Nonce, nowStr, nowStr,
+			); err != nil {
+				return fmt.Errorf("upserting credential %q: %w", key, err)
+			}
+			continue
+		}
 		id := newUUID()
-		_, err = tx.ExecContext(ctx,
-			s.dialect.Rebind(`INSERT INTO credentials (id, vault_id, key, type, ciphertext, nonce, created_at, updated_at)
-			 VALUES (?, ?, ?, 'static', ?, ?, ?, ?)
+		res, err := tx.ExecContext(ctx,
+			s.dialect.Rebind(`INSERT INTO credentials (id, vault_id, key, type, ciphertext, nonce, version, created_at, updated_at)
+			 VALUES (?, ?, ?, 'static', ?, ?, ?, ?, ?)
 			 ON CONFLICT(vault_id, key) DO UPDATE SET
 			   ciphertext = excluded.ciphertext,
 			   nonce = excluded.nonce,
-			   updated_at = excluded.updated_at`),
-			id, vaultID, key, enc.Ciphertext, enc.Nonce, nowStr, nowStr,
+			   version = excluded.version,
+			   updated_at = excluded.updated_at
+			 WHERE credentials.version = ?`),
+			id, vaultID, key, enc.Ciphertext, enc.Nonce, int64(enc.Version), nowStr, nowStr, int64(enc.Version-1),
 		)
 		if err != nil {
 			return fmt.Errorf("upserting credential %q: %w", key, err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return fmt.Errorf("upserting credential %q: %w", key, ErrVersionConflict)
 		}
 	}
 
@@ -2228,8 +2325,8 @@ func (s *SQLStore) ApplyProposal(ctx context.Context, vaultID string, proposalID
 		_, err = tx.ExecContext(ctx,
 			s.dialect.Rebind(`INSERT INTO credential_oauth (vault_id, credential_key, authorization_url, token_url, client_id,
 			   client_secret_ct, client_secret_nonce, scopes, scope_separator, disable_pkce, token_auth_method,
-			   created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			   client_secret_version, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(vault_id, credential_key) DO UPDATE SET
 			   authorization_url = excluded.authorization_url,
 			   token_url = excluded.token_url,
@@ -2240,6 +2337,9 @@ func (s *SQLStore) ApplyProposal(ctx context.Context, vaultID string, proposalID
 			   client_secret_nonce = CASE WHEN excluded.token_url = credential_oauth.token_url
 			     THEN COALESCE(excluded.client_secret_nonce, credential_oauth.client_secret_nonce)
 			     ELSE excluded.client_secret_nonce END,
+			   client_secret_version = CASE WHEN excluded.client_secret_ct IS NOT NULL
+			     THEN credential_oauth.client_secret_version + 1
+			     ELSE credential_oauth.client_secret_version END,
 			   scopes = excluded.scopes,
 			   scope_separator = excluded.scope_separator,
 			   disable_pkce = excluded.disable_pkce,
@@ -2255,7 +2355,7 @@ func (s *SQLStore) ApplyProposal(ctx context.Context, vaultID string, proposalID
 			   updated_at = excluded.updated_at`),
 			vaultID, oc.Key, nullableString(oc.AuthorizationURL), oc.TokenURL, oc.ClientID,
 			oc.ClientSecretCT, oc.ClientSecretNonce, nullableString(oc.Scopes), scopeSep, disablePKCE, tokenAuthMethod,
-			nowStr, nowStr,
+			versionIfSet(oc.ClientSecretCT), nowStr, nowStr,
 		)
 		if err != nil {
 			return fmt.Errorf("upserting credential_oauth %q: %w", oc.Key, err)
@@ -2347,7 +2447,7 @@ func (s *SQLStore) scanVault(row *sql.Row) (*Vault, error) {
 func (s *SQLStore) scanCredential(row *sql.Row) (*Credential, error) {
 	var cred Credential
 	var createdAt, updatedAt interface{}
-	if err := row.Scan(&cred.ID, &cred.VaultID, &cred.Key, &cred.Type, &cred.Ciphertext, &cred.Nonce, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&cred.ID, &cred.VaultID, &cred.Key, &cred.Type, &cred.Ciphertext, &cred.Nonce, &cred.Version, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
 	cred.CreatedAt, _ = s.dialect.ScanTime(createdAt)
@@ -3657,4 +3757,131 @@ func (s *SQLStore) VaultIDsWithLogs(ctx context.Context) ([]string, error) {
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+// versionIfSet is the version a freshly inserted row gets for a ciphertext
+// column: 1 when a ciphertext is written, 0 when the column stays NULL.
+func versionIfSet(ct []byte) int64 {
+	if ct == nil {
+		return 0
+	}
+	return 1
+}
+
+// --- Row-bound AAD migration support ---
+
+// RewrapCredential replaces a credential's ciphertext with one sealed for
+// fromVersion+1, only if the row is still at fromVersion.
+func (s *SQLStore) RewrapCredential(ctx context.Context, vaultID, key string, fromVersion uint64, ciphertext, nonce []byte) error {
+	res, err := s.db.ExecContext(ctx,
+		s.dialect.Rebind(`UPDATE credentials SET ciphertext = ?, nonce = ?, version = ?
+		 WHERE vault_id = ? AND key = ? AND version = ?`),
+		ciphertext, nonce, int64(fromVersion+1), vaultID, key, int64(fromVersion),
+	)
+	if err != nil {
+		return fmt.Errorf("rewrapping credential %q: %w", key, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrVersionConflict
+	}
+	return nil
+}
+
+// RewrapCredentialOAuth replaces the refresh-token and client-secret
+// ciphertexts of an OAuth row (sealed for co.Version / co.ClientSecretVersion)
+// only if the row is still at the given previous versions.
+func (s *SQLStore) RewrapCredentialOAuth(ctx context.Context, co *CredentialOAuth, fromVersion, fromClientSecretVersion uint64) error {
+	res, err := s.db.ExecContext(ctx,
+		s.dialect.Rebind(`UPDATE credential_oauth SET
+		   refresh_token_ct = ?, refresh_token_nonce = ?, version = ?,
+		   client_secret_ct = ?, client_secret_nonce = ?, client_secret_version = ?
+		 WHERE vault_id = ? AND credential_key = ? AND version = ? AND client_secret_version = ?`),
+		co.RefreshTokenCT, co.RefreshTokenNonce, int64(co.Version),
+		co.ClientSecretCT, co.ClientSecretNonce, int64(co.ClientSecretVersion),
+		co.VaultID, co.CredentialKey, int64(fromVersion), int64(fromClientSecretVersion),
+	)
+	if err != nil {
+		return fmt.Errorf("rewrapping oauth credential %q: %w", co.CredentialKey, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrVersionConflict
+	}
+	return nil
+}
+
+// ListCredentialOAuthKeys returns (vault_id, credential_key) for every OAuth row.
+func (s *SQLStore) ListCredentialOAuthKeys(ctx context.Context) ([][2]string, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT vault_id, credential_key FROM credential_oauth ORDER BY vault_id, credential_key")
+	if err != nil {
+		return nil, fmt.Errorf("listing oauth credentials: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out [][2]string
+	for rows.Next() {
+		var v, k string
+		if err := rows.Scan(&v, &k); err != nil {
+			return nil, err
+		}
+		out = append(out, [2]string{v, k})
+	}
+	return out, rows.Err()
+}
+
+// ProposalCredentialRef identifies one proposal_credentials row.
+type ProposalCredentialRef struct {
+	VaultID    string
+	ProposalID int
+	Key        string
+}
+
+// ListProposalCredentialRefs returns every proposal_credentials row id.
+func (s *SQLStore) ListProposalCredentialRefs(ctx context.Context) ([]ProposalCredentialRef, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT vault_id, proposal_id, key FROM proposal_credentials ORDER BY vault_id, proposal_id, key")
+	if err != nil {
+		return nil, fmt.Errorf("listing proposal credentials: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []ProposalCredentialRef
+	for rows.Next() {
+		var r ProposalCredentialRef
+		if err := rows.Scan(&r.VaultID, &r.ProposalID, &r.Key); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RewrapProposalCredential replaces a proposal credential's ciphertext with
+// one sealed for fromVersion+1, only if the row is still at fromVersion.
+func (s *SQLStore) RewrapProposalCredential(ctx context.Context, vaultID string, proposalID int, key string, fromVersion uint64, ciphertext, nonce []byte) error {
+	res, err := s.db.ExecContext(ctx,
+		s.dialect.Rebind(`UPDATE proposal_credentials SET ciphertext = ?, nonce = ?, version = ?
+		 WHERE vault_id = ? AND proposal_id = ? AND key = ? AND version = ?`),
+		ciphertext, nonce, int64(fromVersion+1), vaultID, proposalID, key, int64(fromVersion),
+	)
+	if err != nil {
+		return fmt.Errorf("rewrapping proposal credential %q: %w", key, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrVersionConflict
+	}
+	return nil
+}
+
+// ReplaceCAStateKey rewrites the encrypted CA root key in ca_state, only if
+// the stored ciphertext is still oldCT.
+func (s *SQLStore) ReplaceCAStateKey(ctx context.Context, oldCT, ciphertext, nonce []byte) error {
+	res, err := s.db.ExecContext(ctx,
+		s.dialect.Rebind(`UPDATE ca_state SET root_key_ct = ?, root_key_nonce = ?, updated_at = ?
+		 WHERE id = 1 AND root_key_ct = ?`),
+		ciphertext, nonce, s.now(), oldCT,
+	)
+	if err != nil {
+		return fmt.Errorf("replacing CA key: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrVersionConflict
+	}
+	return nil
 }

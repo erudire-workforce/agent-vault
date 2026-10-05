@@ -19,7 +19,6 @@ import (
 
 	"github.com/Infisical/agent-vault/internal/auth"
 	"github.com/Infisical/agent-vault/internal/brokercore"
-	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/infisical"
 	"github.com/Infisical/agent-vault/internal/notify"
 	"github.com/Infisical/agent-vault/internal/store"
@@ -247,15 +246,41 @@ func (m *mockStore) GetVault(_ context.Context, name string) (*store.Vault, erro
 }
 
 func (m *mockStore) SetCredential(_ context.Context, vaultID, key string, ciphertext, nonce []byte) (*store.Credential, error) {
+	var version uint64 = 1
+	if prev, ok := m.credentials[vaultID+":"+key]; ok {
+		version = prev.Version + 1
+	}
 	s := &store.Credential{
 		ID:         "credential-" + key,
 		VaultID:    vaultID,
 		Key:        key,
 		Ciphertext: ciphertext,
 		Nonce:      nonce,
+		Version:    version,
 	}
 	m.credentials[vaultID+":"+key] = s
 	return s, nil
+}
+
+// SetCredentialVersion mirrors the SQL store's compare-and-set write.
+func (m *mockStore) SetCredentialVersion(_ context.Context, vaultID, key string, ciphertext, nonce []byte, version uint64) (*store.Credential, error) {
+	if prev, ok := m.credentials[vaultID+":"+key]; ok && prev.Version != version-1 {
+		return nil, store.ErrVersionConflict
+	}
+	s := &store.Credential{
+		ID: "credential-" + key, VaultID: vaultID, Key: key,
+		Ciphertext: ciphertext, Nonce: nonce, Version: version,
+	}
+	m.credentials[vaultID+":"+key] = s
+	return s, nil
+}
+
+func (m *mockStore) CreateProposalWithSealer(ctx context.Context, vaultID, sessionID, servicesJSON, credentialsJSON, message, userMessage string, seal func(int) (map[string]store.EncryptedCredential, error)) (*store.Proposal, error) {
+	creds, err := seal(len(m.proposals[vaultID]) + 1)
+	if err != nil {
+		return nil, err
+	}
+	return m.CreateProposal(ctx, vaultID, sessionID, servicesJSON, credentialsJSON, message, userMessage, creds)
 }
 
 func (m *mockStore) ListCredentials(_ context.Context, vaultID string) ([]store.Credential, error) {
@@ -2275,18 +2300,19 @@ func TestCredentialsListDefaultVault(t *testing.T) {
 // helper: pre-populate an encrypted credential in the mock store.
 func seedEncryptedCredential(t *testing.T, ms *mockStore, encKey []byte, vaultID, key, plaintext string) {
 	t.Helper()
-	ciphertext, nonce, err := crypto.Encrypt([]byte(plaintext), encKey)
+	ciphertext, nonce, err := store.CredentialValueAAD(vaultID, key, 1).Seal([]byte(plaintext), encKey)
 	if err != nil {
 		t.Fatalf("encrypt: %v", err)
 	}
 	ms.credentials[vaultID+":"+key] = &store.Credential{
 		ID: "credential-" + key, VaultID: vaultID, Key: key,
-		Ciphertext: ciphertext, Nonce: nonce,
+		Ciphertext: ciphertext, Nonce: nonce, Version: 1,
 	}
 }
 
 func TestCredentialsRevealMember(t *testing.T) {
-	// User session (owner) — member+ on vault, should see decrypted values.
+	// User session (owner) — member+ on vault. Stored values are write-only
+	// for every role (fork policy): reveal returns metadata, never the value.
 	ms, token := setupMockStoreWithSession(t)
 	encKey := make([]byte, 32)
 	srv := newTestServer(withStore(ms), withEncKey(encKey))
@@ -2310,8 +2336,11 @@ func TestCredentialsRevealMember(t *testing.T) {
 	if len(resp.Credentials) != 1 {
 		t.Fatalf("expected 1 credential, got %d", len(resp.Credentials))
 	}
-	if resp.Credentials[0].Value != "s3cr3t" {
-		t.Fatalf("expected value %q, got %q", "s3cr3t", resp.Credentials[0].Value)
+	if c := resp.Credentials[0]; c.Value != "" || c.Version != 1 || c.Hint == "" {
+		t.Fatalf("expected metadata only (no value, version 1, masked hint), got %+v", c)
+	}
+	if strings.Contains(rec.Body.String(), "s3cr3t") {
+		t.Fatalf("reveal response carries the stored value: %s", rec.Body.String())
 	}
 }
 
@@ -2340,8 +2369,8 @@ func TestCredentialsRevealSingleKey(t *testing.T) {
 	if len(resp.Credentials) != 1 {
 		t.Fatalf("expected 1 credential, got %d", len(resp.Credentials))
 	}
-	if resp.Credentials[0].Key != "A_KEY" || resp.Credentials[0].Value != "val-a" {
-		t.Fatalf("unexpected credential: %+v", resp.Credentials[0])
+	if resp.Credentials[0].Key != "A_KEY" || resp.Credentials[0].Value != "" || resp.Credentials[0].Version != 1 {
+		t.Fatalf("unexpected credential (want A_KEY metadata, no value): %+v", resp.Credentials[0])
 	}
 }
 
@@ -2380,7 +2409,8 @@ func TestCredentialsRevealProxyBlocked(t *testing.T) {
 }
 
 func TestCredentialsRevealScopedMemberAllowed(t *testing.T) {
-	// Scoped session with member role — should be allowed to reveal.
+	// Scoped session with member role — allowed to call reveal, which returns
+	// metadata only (stored values are write-only).
 	ms, token := setupMockStoreWithScopedSessionRole(t, "default", "root-ns-id", "member")
 	encKey := make([]byte, 32)
 	srv := newTestServer(withStore(ms), withEncKey(encKey))
@@ -2401,8 +2431,8 @@ func TestCredentialsRevealScopedMemberAllowed(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(resp.Credentials) != 1 || resp.Credentials[0].Value != "my-token" {
-		t.Fatalf("unexpected credentials: %+v", resp.Credentials)
+	if len(resp.Credentials) != 1 || resp.Credentials[0].Value != "" || resp.Credentials[0].Key != "TOKEN" {
+		t.Fatalf("unexpected credentials (want TOKEN metadata, no value): %+v", resp.Credentials)
 	}
 }
 
@@ -2501,13 +2531,13 @@ func setupVaultWithCredential(t *testing.T, servicesJSON string) (*mockStore, st
 		ServicesJSON: servicesJSON,
 	}
 
-	ct, nonce, err := crypto.Encrypt([]byte("sk_live_xxx"), encKey)
+	ct, nonce, err := store.CredentialValueAAD("root-ns-id", "STRIPE_KEY", 1).Seal([]byte("sk_live_xxx"), encKey)
 	if err != nil {
 		t.Fatalf("Encrypt: %v", err)
 	}
 	ms.credentials["root-ns-id:STRIPE_KEY"] = &store.Credential{
 		ID: "credential-stripe", VaultID: "root-ns-id", Key: "STRIPE_KEY",
-		Ciphertext: ct, Nonce: nonce,
+		Ciphertext: ct, Nonce: nonce, Version: 1,
 	}
 
 	return ms, sess.ID, encKey
@@ -3360,21 +3390,13 @@ func TestVaultCredentialStoreSwitchToBuiltin(t *testing.T) {
 	}
 	srv := newTestServer(withStore(ms))
 
+	// Credential-store switching is disabled for every role (fork policy).
 	rec := patchCredentialStore(t, srv, ownerToken, "default", `{"kind":"builtin"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 (switching disabled), got %d: %s", rec.Code, rec.Body.String())
 	}
-	if _, ok := ms.credStores["root-ns-id"]; ok {
-		t.Fatalf("expected credential-store row removed after switch to builtin")
-	}
-	var resp struct {
-		CredentialStore map[string]interface{} `json:"credential_store"`
-	}
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if resp.CredentialStore["kind"] != store.CredentialStoreBuiltin {
-		t.Fatalf("want kind builtin, got %v", resp.CredentialStore)
+	if _, ok := ms.credStores["root-ns-id"]; !ok {
+		t.Fatalf("credential-store row changed although switching is disabled")
 	}
 }
 
@@ -3395,21 +3417,21 @@ func TestVaultCredentialStoreSwitchInvalidKind(t *testing.T) {
 	srv := newTestServer(withStore(ms))
 
 	rec := patchCredentialStore(t, srv, ownerToken, "default", `{"kind":"bogus"}`)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for unknown kind, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 (switching disabled) for any kind, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
-// Switching to Infisical when the server has no Infisical client must 503,
-// mirroring the create gate.
+// Switching to Infisical is refused (switching disabled), with or without a
+// client attached.
 func TestVaultCredentialStoreSwitchToInfisicalNoClient(t *testing.T) {
 	ms, ownerToken := setupMockStoreWithSession(t)
 	srv := newTestServer(withStore(ms)) // no AttachInfisical → infisicalClient nil
 
 	body := `{"kind":"infisical","config":{"project_id":"p","environment":"dev","secret_path":"/"},"poll_interval_seconds":60}`
 	rec := patchCredentialStore(t, srv, ownerToken, "default", body)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 without infisical client, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 (switching disabled), got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -3431,8 +3453,8 @@ func TestVaultCredentialStoreSwitchToInfisicalRequiresOwner(t *testing.T) {
 	}
 }
 
-// Disconnecting (switch to builtin) stays allowed for a non-owner vault admin —
-// only the connect path is owner-gated.
+// Disconnecting (switch to builtin) is refused for a vault admin too:
+// switching is disabled for every role.
 func TestVaultCredentialStoreSwitchToBuiltinAllowsAdmin(t *testing.T) {
 	ms, _ := setupMockStoreWithSession(t)
 	adminToken := setupMemberSession(t, ms, "root-ns-id")
@@ -3444,8 +3466,11 @@ func TestVaultCredentialStoreSwitchToBuiltinAllowsAdmin(t *testing.T) {
 	srv := newTestServer(withStore(ms))
 
 	rec := patchCredentialStore(t, srv, adminToken, "default", `{"kind":"builtin"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 for non-owner admin disconnect, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 (switching disabled) for admin disconnect, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, ok := ms.credStores["root-ns-id"]; !ok {
+		t.Fatalf("credential-store row changed although switching is disabled")
 	}
 }
 
@@ -4998,8 +5023,11 @@ func TestInviteOnlyBlocksRegistration(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 when invite-only is enabled, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "invite-only") {
-		t.Fatalf("expected invite-only error message, got: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "invite") {
+		t.Fatalf("expected an invite-required error message, got: %s", rec.Body.String())
+	}
+	if u, _ := ms.GetUserByEmail(context.Background(), "new@test.com"); u != nil {
+		t.Fatalf("registration created a user row")
 	}
 }
 
@@ -5020,6 +5048,8 @@ func TestInviteOnlyAllowsFirstUser(t *testing.T) {
 }
 
 func TestInviteOnlyDisabledAllowsRegistration(t *testing.T) {
+	// Fork policy: open registration only bootstraps the first account. Once a
+	// user exists it is refused even with invite_only unset.
 	ms := setupMockStoreWithUser(t, "owner@test.com", "owner-password-123")
 	// invite_only not set (default: disabled)
 	srv := newTestServer(withStore(ms))
@@ -5029,9 +5059,11 @@ func TestInviteOnlyDisabledAllowsRegistration(t *testing.T) {
 	rec := httptest.NewRecorder()
 	srv.httpServer.Handler.ServeHTTP(rec, req)
 
-	// Should succeed (201 with verification required)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("expected 201 when invite-only is disabled, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 once a user exists (registration locked), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if u, _ := ms.GetUserByEmail(context.Background(), "new@test.com"); u != nil {
+		t.Fatalf("registration created a user row")
 	}
 }
 
@@ -5839,18 +5871,23 @@ func TestReRegisterInactiveUserDoesNotOverwritePassword(t *testing.T) {
 	srv := newTestServer(withStore(ms))
 
 	// Attacker re-registers with the victim's email and a different password.
+	// Registration is locked once any user exists (fork policy), so this is
+	// refused outright and no verification code is issued.
 	regBody := `{"email":"victim@test.com","password":"attacker-password"}`
 	regRec := httptest.NewRecorder()
 	srv.httpServer.Handler.ServeHTTP(regRec, httptest.NewRequest(http.MethodPost, "/v1/auth/register", strings.NewReader(regBody)))
-	if regRec.Code != http.StatusCreated {
-		t.Fatalf("re-register: expected 201, got %d: %s", regRec.Code, regRec.Body.String())
+	if regRec.Code != http.StatusForbidden {
+		t.Fatalf("re-register: expected 403 (registration locked), got %d: %s", regRec.Code, regRec.Body.String())
+	}
+	if len(ms.emailVerifications) != 0 {
+		t.Fatalf("expected no verification code, got %d", len(ms.emailVerifications))
 	}
 
-	// A verification code should have been generated.
-	if len(ms.emailVerifications) != 1 {
-		t.Fatalf("expected 1 verification code, got %d", len(ms.emailVerifications))
+	// The victim's own verification still works and keeps the original password.
+	code := "123456"
+	if _, err := ms.CreateEmailVerification(context.Background(), "victim@test.com", code, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("CreateEmailVerification: %v", err)
 	}
-	code := ms.emailVerifications[0].Code
 
 	// Victim verifies with the code.
 	verifyBody := fmt.Sprintf(`{"email":"victim@test.com","code":"%s"}`, code)
@@ -5878,22 +5915,24 @@ func TestReRegisterInactiveUserDoesNotOverwritePassword(t *testing.T) {
 }
 
 func TestReRegisterInactiveUserUniformResponse(t *testing.T) {
+	// Registration is locked once any user exists (fork policy): an existing
+	// inactive account, an existing active account and an unknown email all
+	// get the same 403, so the response does not reveal which emails exist.
 	ms := setupMockStoreWithInactiveUser(t, "existing@test.com", "password123")
 	srv := newTestServer(withStore(ms))
 
-	// Re-register an inactive account.
-	regBody := `{"email":"existing@test.com","password":"different-password"}`
-	regRec := httptest.NewRecorder()
-	srv.httpServer.Handler.ServeHTTP(regRec, httptest.NewRequest(http.MethodPost, "/v1/auth/register", strings.NewReader(regBody)))
-	if regRec.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d: %s", regRec.Code, regRec.Body.String())
+	var bodies []string
+	for _, email := range []string{"existing@test.com", "unknown@test.com"} {
+		regBody := `{"email":"` + email + `","password":"different-password"}`
+		regRec := httptest.NewRecorder()
+		srv.httpServer.Handler.ServeHTTP(regRec, httptest.NewRequest(http.MethodPost, "/v1/auth/register", strings.NewReader(regBody)))
+		if regRec.Code != http.StatusForbidden {
+			t.Fatalf("%s: expected 403, got %d: %s", email, regRec.Code, regRec.Body.String())
+		}
+		bodies = append(bodies, regRec.Body.String())
 	}
-
-	var resp map[string]interface{}
-	json.NewDecoder(regRec.Body).Decode(&resp)
-
-	if resp["message"] != registerUniformMessage {
-		t.Fatalf("expected uniform message %q, got %q", registerUniformMessage, resp["message"])
+	if bodies[0] != bodies[1] {
+		t.Fatalf("registration responses differ for existing and unknown emails: %q vs %q", bodies[0], bodies[1])
 	}
 }
 

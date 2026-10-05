@@ -3,6 +3,9 @@ module github.com/Infisical/agent-vault
 go 1.25.0
 
 require (
+	github.com/aws/aws-sdk-go-v2 v1.27.2
+	github.com/aws/aws-sdk-go-v2/config v1.27.18
+	github.com/aws/aws-sdk-go-v2/service/kms v1.32.3
 	github.com/charmbracelet/huh v1.0.0
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/denisbrodbeck/machineid v1.0.1
@@ -31,8 +34,6 @@ require (
 	cloud.google.com/go/iam v1.1.11 // indirect
 	github.com/andybalholm/brotli v1.1.1 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
-	github.com/aws/aws-sdk-go-v2 v1.27.2 // indirect
-	github.com/aws/aws-sdk-go-v2/config v1.27.18 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.17.18 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.5 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.3.9 // indirect

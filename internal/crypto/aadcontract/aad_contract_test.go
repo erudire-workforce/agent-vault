@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // Package aadcontract_test pins the API and the byte format that the
 // row-bound AAD patch must provide in internal/crypto. It lives in its own
 // directory so that, before the patch exists, the expected compile failure

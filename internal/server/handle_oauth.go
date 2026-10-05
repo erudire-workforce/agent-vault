@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -11,9 +12,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/broker"
+	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/oauth"
 	"github.com/Infisical/agent-vault/internal/store"
@@ -93,15 +96,30 @@ func (s *Server) handleOAuthConnect(w http.ResponseWriter, r *http.Request) {
 	// Handle client_secret: sentinel = keep current, empty = clear, other = set new.
 	// Only reuse stored secret when the provider config hasn't changed
 	// to prevent exfiltration via a new token_url.
-	var clientSecretCT, clientSecretNonce []byte
+	// SetCredentialOAuth bumps client_secret_version whenever a client
+	// secret ciphertext is written, so the value (new or kept) is sealed for
+	// the next version.
+	existing, _ := s.store.GetCredentialOAuth(ctx, ns.ID, req.Key)
+	var csVersion uint64
+	if existing != nil {
+		csVersion = existing.ClientSecretVersion
+	}
+	var clientSecret []byte
 	if req.ClientSecret == oauthSecretSentinel {
-		existing, _ := s.store.GetCredentialOAuth(ctx, ns.ID, req.Key)
-		if existing != nil && existing.TokenURL == req.TokenURL {
-			clientSecretCT = existing.ClientSecretCT
-			clientSecretNonce = existing.ClientSecretNonce
+		if existing != nil && existing.TokenURL == req.TokenURL && len(existing.ClientSecretCT) > 0 {
+			clientSecret, err = store.OAuthClientSecretAAD(ns.ID, req.Key, csVersion).Open(existing.ClientSecretCT, existing.ClientSecretNonce, s.encKey)
+			if err != nil {
+				jsonError(w, http.StatusInternalServerError, "Failed to decrypt client secret")
+				return
+			}
 		}
 	} else if req.ClientSecret != "" {
-		clientSecretCT, clientSecretNonce, err = crypto.Encrypt([]byte(req.ClientSecret), s.encKey)
+		clientSecret = []byte(req.ClientSecret)
+	}
+	var clientSecretCT, clientSecretNonce []byte
+	if clientSecret != nil {
+		clientSecretCT, clientSecretNonce, err = store.OAuthClientSecretAAD(ns.ID, req.Key, csVersion+1).Seal(clientSecret, s.encKey)
+		crypto.WipeBytes(clientSecret)
 		if err != nil {
 			jsonError(w, http.StatusInternalServerError, "Encryption failed")
 			return
@@ -211,7 +229,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 
 	var clientSecret string
 	if len(oauthCfg.ClientSecretCT) > 0 {
-		cs, err := crypto.Decrypt(oauthCfg.ClientSecretCT, oauthCfg.ClientSecretNonce, s.encKey)
+		cs, err := store.OAuthClientSecretAAD(st.VaultID, st.CredentialKey, oauthCfg.ClientSecretVersion).Open(oauthCfg.ClientSecretCT, oauthCfg.ClientSecretNonce, s.encKey)
 		if err != nil {
 			s.redirectOAuthComplete(w, r, "", "", "error", "Failed to decrypt client secret")
 			return
@@ -230,11 +248,14 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		TokenAuthMethod: oauthCfg.TokenAuthMethod,
 	})
 	if err != nil {
-		s.redirectOAuthComplete(w, r, "", "", "error", fmt.Sprintf("Token exchange failed: %v", err))
+		// Never put the token endpoint's response in the redirect URL: it
+		// lands in browser history and access logs, and providers echo the
+		// code and client secret in error bodies.
+		s.redirectOAuthComplete(w, r, "", "", "error", "Token exchange failed: "+brokercore.RefreshErrorMessage(err))
 		return
 	}
 
-	accessCT, accessNonce, err := crypto.Encrypt([]byte(tok.AccessToken), s.encKey)
+	accessCT, accessNonce, err := store.CredentialValueAAD(st.VaultID, st.CredentialKey, s.credentialVersion(ctx, st.VaultID, st.CredentialKey)+1).Seal([]byte(tok.AccessToken), s.encKey)
 	if err != nil {
 		s.redirectOAuthComplete(w, r, "", "", "error", "Failed to encrypt access token")
 		return
@@ -242,7 +263,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 
 	var refreshCT, refreshNonce []byte
 	if tok.RefreshToken != "" {
-		refreshCT, refreshNonce, err = crypto.Encrypt([]byte(tok.RefreshToken), s.encKey)
+		refreshCT, refreshNonce, err = store.OAuthRefreshTokenAAD(st.VaultID, st.CredentialKey, oauthCfg.Version+1).Seal([]byte(tok.RefreshToken), s.encKey)
 		if err != nil {
 			s.redirectOAuthComplete(w, r, "", "", "error", "Failed to encrypt refresh token")
 			return
@@ -311,7 +332,8 @@ func (s *Server) handleOAuthStatus(w http.ResponseWriter, r *http.Request) {
 		resp.ConnectedAt = &t
 	}
 	if oauthCfg.LastRefreshError != "" {
-		resp.LastError = &oauthCfg.LastRefreshError
+		msg := safeRefreshError(oauthCfg.LastRefreshError)
+		resp.LastError = &msg
 	}
 
 	jsonOK(w, resp)
@@ -381,7 +403,7 @@ func (s *Server) handleOAuthTokenUpload(w http.ResponseWriter, r *http.Request) 
 		// to the new endpoint (prevents client secret exfiltration).
 		providerUnchanged := tokenURL == existing.TokenURL
 		if clientSecret == "" && len(existing.ClientSecretCT) > 0 && providerUnchanged {
-			cs, err := crypto.Decrypt(existing.ClientSecretCT, existing.ClientSecretNonce, s.encKey)
+			cs, err := store.OAuthClientSecretAAD(ns.ID, req.Key, existing.ClientSecretVersion).Open(existing.ClientSecretCT, existing.ClientSecretNonce, s.encKey)
 			if err == nil {
 				clientSecret = string(cs)
 			}
@@ -408,12 +430,19 @@ func (s *Server) handleOAuthTokenUpload(w http.ResponseWriter, r *http.Request) 
 			TokenAuthMethod: tokenAuthMethod,
 		})
 		if refreshErr != nil {
-			jsonError(w, http.StatusBadRequest, fmt.Sprintf("Refresh token validation failed: %v", refreshErr))
+			jsonError(w, http.StatusBadRequest, "Refresh token validation failed: "+brokercore.RefreshErrorMessage(refreshErr))
 			return
 		}
 
-		// Refresh succeeded — use the fresh tokens.
-		accessCT, accessNonce, err := crypto.Encrypt([]byte(tok.AccessToken), s.encKey)
+		// Refresh succeeded — use the fresh tokens. Versions: SetCredentialOAuth
+		// below bumps client_secret_version (when a secret is written) but not
+		// version (no refresh token passed); UpdateCredentialOAuthTokens then
+		// bumps credentials.version and credential_oauth.version.
+		var oauthVersion, csVersion uint64
+		if existing != nil {
+			oauthVersion, csVersion = existing.Version, existing.ClientSecretVersion
+		}
+		accessCT, accessNonce, err := store.CredentialValueAAD(ns.ID, req.Key, s.credentialVersion(ctx, ns.ID, req.Key)+1).Seal([]byte(tok.AccessToken), s.encKey)
 		if err != nil {
 			jsonError(w, http.StatusInternalServerError, "Encryption failed")
 			return
@@ -422,7 +451,7 @@ func (s *Server) handleOAuthTokenUpload(w http.ResponseWriter, r *http.Request) 
 		if tok.RefreshToken != "" {
 			refreshToken = tok.RefreshToken
 		}
-		refreshCT, refreshNonce, err := crypto.Encrypt([]byte(refreshToken), s.encKey)
+		refreshCT, refreshNonce, err := store.OAuthRefreshTokenAAD(ns.ID, req.Key, oauthVersion+1).Seal([]byte(refreshToken), s.encKey)
 		if err != nil {
 			jsonError(w, http.StatusInternalServerError, "Encryption failed")
 			return
@@ -430,7 +459,7 @@ func (s *Server) handleOAuthTokenUpload(w http.ResponseWriter, r *http.Request) 
 
 		var clientSecretCT, clientSecretNonce []byte
 		if clientSecret != "" {
-			clientSecretCT, clientSecretNonce, err = crypto.Encrypt([]byte(clientSecret), s.encKey)
+			clientSecretCT, clientSecretNonce, err = store.OAuthClientSecretAAD(ns.ID, req.Key, csVersion+1).Seal([]byte(clientSecret), s.encKey)
 			if err != nil {
 				jsonError(w, http.StatusInternalServerError, "Encryption failed")
 				return
@@ -475,14 +504,23 @@ func (s *Server) handleOAuthTokenUpload(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// No new refresh token — store access token as-is (edit mode or access-only upload).
+	// UpdateCredentialOAuthTokens bumps credentials.version (always) and
+	// credential_oauth.version (when a refresh token is written), so kept
+	// values are re-sealed for the next version.
+	credVersion := s.credentialVersion(ctx, ns.ID, req.Key)
+	accessAAD := store.CredentialValueAAD(ns.ID, req.Key, credVersion+1)
 	var accessCT, accessNonce []byte
 	if isAccessSentinel {
 		cred, _ := s.store.GetCredential(ctx, ns.ID, req.Key)
 		if cred != nil && len(cred.Ciphertext) > 0 {
-			plaintext, decErr := crypto.Decrypt(cred.Ciphertext, cred.Nonce, s.encKey)
+			plaintext, decErr := store.CredentialValueAAD(ns.ID, req.Key, cred.Version).Open(cred.Ciphertext, cred.Nonce, s.encKey)
 			if decErr == nil && string(plaintext) != "" {
-				accessCT = cred.Ciphertext
-				accessNonce = cred.Nonce
+				accessCT, accessNonce, err = accessAAD.Seal(plaintext, s.encKey)
+				crypto.WipeBytes(plaintext)
+				if err != nil {
+					jsonError(w, http.StatusInternalServerError, "Encryption failed")
+					return
+				}
 			}
 		}
 		if len(accessCT) == 0 && !hasNewRefreshToken {
@@ -490,19 +528,33 @@ func (s *Server) handleOAuthTokenUpload(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	} else if req.AccessToken != "" {
-		accessCT, accessNonce, err = crypto.Encrypt([]byte(req.AccessToken), s.encKey)
+		accessCT, accessNonce, err = accessAAD.Seal([]byte(req.AccessToken), s.encKey)
 		if err != nil {
 			jsonError(w, http.StatusInternalServerError, "Encryption failed")
 			return
 		}
 	}
 
+	var oauthVersion uint64
+	if existing != nil {
+		oauthVersion = existing.Version
+	}
+	refreshAAD := store.OAuthRefreshTokenAAD(ns.ID, req.Key, oauthVersion+1)
 	var refreshCT, refreshNonce []byte
-	if isRefreshSentinel && existing != nil {
-		refreshCT = existing.RefreshTokenCT
-		refreshNonce = existing.RefreshTokenNonce
+	if isRefreshSentinel && existing != nil && len(existing.RefreshTokenCT) > 0 {
+		pt, decErr := store.OAuthRefreshTokenAAD(ns.ID, req.Key, existing.Version).Open(existing.RefreshTokenCT, existing.RefreshTokenNonce, s.encKey)
+		if decErr != nil {
+			jsonError(w, http.StatusInternalServerError, "Failed to decrypt refresh token")
+			return
+		}
+		refreshCT, refreshNonce, err = refreshAAD.Seal(pt, s.encKey)
+		crypto.WipeBytes(pt)
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "Encryption failed")
+			return
+		}
 	} else if hasNewRefreshToken {
-		refreshCT, refreshNonce, err = crypto.Encrypt([]byte(req.RefreshToken), s.encKey)
+		refreshCT, refreshNonce, err = refreshAAD.Seal([]byte(req.RefreshToken), s.encKey)
 		if err != nil {
 			jsonError(w, http.StatusInternalServerError, "Encryption failed")
 			return
@@ -552,6 +604,29 @@ func (s *Server) redirectOAuthComplete(w http.ResponseWriter, r *http.Request, v
 	}
 	http.Redirect(w, r, u, http.StatusFound)
 }
+
+// credentialVersion returns the current credentials.version of a row, or 0
+// when the row does not exist yet.
+func (s *Server) credentialVersion(ctx context.Context, vaultID, key string) uint64 {
+	c, err := s.store.GetCredential(ctx, vaultID, key)
+	if err != nil || c == nil {
+		return 0
+	}
+	return c.Version
+}
+
+// safeRefreshError returns a stored last_refresh_error only when it has the
+// sanitized shape written by brokercore.RefreshErrorMessage; rows written
+// before sanitization may hold a raw token-endpoint body and are replaced
+// by a fixed message.
+func safeRefreshError(msg string) string {
+	if safeRefreshErrorRe.MatchString(msg) {
+		return msg
+	}
+	return "oauth: token request failed"
+}
+
+var safeRefreshErrorRe = regexp.MustCompile(`^oauth: token (endpoint returned [0-9]{3}( \([a-z_]+\))?|request failed)$`)
 
 
 func isValidHTTPURL(raw string) bool {

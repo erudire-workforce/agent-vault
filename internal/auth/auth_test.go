@@ -2,8 +2,6 @@ package auth
 
 import (
 	"testing"
-
-	"github.com/Infisical/agent-vault/internal/crypto"
 )
 
 func TestSetupWithPasswordAndUnlockRoundTrip(t *testing.T) {
@@ -130,7 +128,7 @@ func TestWrapDEKRoundTrip(t *testing.T) {
 	}
 
 	// Build a verification record to unlock.
-	sentinelCT, sentinelNonce, err := crypto.Encrypt([]byte(sentinel), mk.Key())
+	sentinelCT, sentinelNonce, err := sentinelAAD.Seal([]byte(sentinel), mk.Key())
 	if err != nil {
 		t.Fatal(err)
 	}

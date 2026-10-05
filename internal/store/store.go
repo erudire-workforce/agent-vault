@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -42,8 +43,11 @@ type Credential struct {
 	Type       string // "static" (default) or "oauth"
 	Ciphertext []byte
 	Nonce      []byte
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// Version is bound into the AAD of Ciphertext (crypto.AAD.Version). It is
+	// bumped on every write of Ciphertext.
+	Version   uint64
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // CredentialOAuth stores the OAuth configuration and refresh state for
@@ -68,8 +72,14 @@ type CredentialOAuth struct {
 	LastRefreshedAt    *time.Time
 	LastRefreshError   string
 	LastRefreshErrorAt *time.Time
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// Version is bound into the AAD of RefreshTokenCT; bumped whenever a new
+	// refresh token ciphertext is written.
+	Version uint64
+	// ClientSecretVersion is bound into the AAD of ClientSecretCT; bumped
+	// whenever a new client secret ciphertext is written.
+	ClientSecretVersion uint64
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 // CredentialOAuthState holds a CSRF state + PKCE verifier for an
@@ -115,6 +125,8 @@ type MasterKeyRecord struct {
 	KDFTime       *uint32
 	KDFMemory     *uint32
 	KDFThreads    *uint8
+	KMSWrappedDEK []byte // DEK wrapped by an external KMS key (nil unless KMS mode)
+	KMSKeyID      string // KMS key that wrapped KMSWrappedDEK ("" unless KMS mode)
 	CreatedAt     time.Time
 }
 
@@ -151,7 +163,14 @@ type Session struct {
 // IsExpired reports whether the session is past its absolute expiry or its
 // idle window. Single source of truth for expiry checks across the server
 // (requireAuth) and proxy ingress (brokercore.SessionResolver).
+//
+// Under AGENT_VAULT_REQUIRE_TOKEN_EXPIRY=1 a session with no absolute expiry
+// counts as expired, so tokens minted before the setting was enabled stop
+// authenticating on both the API and the proxy.
 func (s *Session) IsExpired(now time.Time) bool {
+	if s.ExpiresAt == nil && TokenExpiryRequired() {
+		return true
+	}
 	if s.ExpiresAt != nil && now.After(*s.ExpiresAt) {
 		return true
 	}
@@ -159,6 +178,14 @@ func (s *Session) IsExpired(now time.Time) bool {
 		return true
 	}
 	return false
+}
+
+// TokenExpiryRequired reports whether AGENT_VAULT_REQUIRE_TOKEN_EXPIRY is
+// enabled: tokens without an expiry are then neither minted nor accepted.
+// Read on every call so the setting applies without a restart.
+func TokenExpiryRequired() bool {
+	v := strings.TrimSpace(os.Getenv("AGENT_VAULT_REQUIRE_TOKEN_EXPIRY"))
+	return v == "1" || strings.EqualFold(v, "true")
 }
 
 // CreateUserSessionParams carries all the fields persisted on a fresh
@@ -232,6 +259,10 @@ type Proposal struct {
 type EncryptedCredential struct {
 	Ciphertext []byte
 	Nonce      []byte
+	// Version is the row version the ciphertext is sealed for. For
+	// proposal_credentials it is read back from the row; for ApplyProposal it
+	// is the new credentials.version the value was sealed under.
+	Version uint64
 }
 
 // EncryptedKV pairs a credential key with its AES-256-GCM ciphertext+nonce.
@@ -458,6 +489,10 @@ type Store interface {
 
 	// Credentials
 	SetCredential(ctx context.Context, vaultID, key string, ciphertext, nonce []byte) (*Credential, error)
+	// SetCredentialVersion is the compare-and-set writer for AAD-sealed
+	// values: ciphertext is sealed for version and the write only lands when
+	// the row is absent or at version-1 (ErrVersionConflict otherwise).
+	SetCredentialVersion(ctx context.Context, vaultID, key string, ciphertext, nonce []byte, version uint64) (*Credential, error)
 	GetCredential(ctx context.Context, vaultID, key string) (*Credential, error)
 	ListCredentials(ctx context.Context, vaultID string) ([]Credential, error)
 	DeleteCredential(ctx context.Context, vaultID, key string) error
@@ -538,6 +573,7 @@ type Store interface {
 
 	// Proposals
 	CreateProposal(ctx context.Context, vaultID, sessionID, servicesJSON, credentialsJSON, message, userMessage string, credentials map[string]EncryptedCredential) (*Proposal, error)
+	CreateProposalWithSealer(ctx context.Context, vaultID, sessionID, servicesJSON, credentialsJSON, message, userMessage string, seal func(proposalID int) (map[string]EncryptedCredential, error)) (*Proposal, error)
 	GetProposal(ctx context.Context, vaultID string, id int) (*Proposal, error)
 	GetProposalByApprovalToken(ctx context.Context, token string) (*Proposal, error)
 	ListProposals(ctx context.Context, vaultID, status string) ([]Proposal, error)
@@ -647,6 +683,14 @@ type Store interface {
 
 	// CA state (persistent CA root for Postgres HA deployments)
 	GetCAState(ctx context.Context) (*CAState, error)
+	ReplaceCAStateKey(ctx context.Context, oldCT, ciphertext, nonce []byte) error
+
+	// Row-bound AAD migration (internal/aadmigrate).
+	RewrapCredential(ctx context.Context, vaultID, key string, fromVersion uint64, ciphertext, nonce []byte) error
+	RewrapCredentialOAuth(ctx context.Context, co *CredentialOAuth, fromVersion, fromClientSecretVersion uint64) error
+	ListCredentialOAuthKeys(ctx context.Context) ([][2]string, error)
+	ListProposalCredentialRefs(ctx context.Context) ([]ProposalCredentialRef, error)
+	RewrapProposalCredential(ctx context.Context, vaultID string, proposalID int, key string, fromVersion uint64, ciphertext, nonce []byte) error
 	SetCAState(ctx context.Context, state *CAState) error
 
 	// LockVault acquires an exclusive advisory lock for the given vault.

@@ -3,13 +3,13 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/broker"
-	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/infisical"
 	"github.com/Infisical/agent-vault/internal/store"
 )
@@ -63,12 +63,7 @@ func (s *Server) handleCredentialsSet(w http.ResponseWriter, r *http.Request) {
 
 	var setKeys []string
 	for key, value := range req.Credentials {
-		ciphertext, nonce, err := crypto.Encrypt([]byte(value), s.encKey)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "Encryption failed")
-			return
-		}
-		if _, err := s.store.SetCredential(ctx, ns.ID, key, ciphertext, nonce); err != nil {
+		if err := s.putCredentialValue(ctx, ns.ID, key, []byte(value)); err != nil {
 			jsonError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to set credential %q", key))
 			return
 		}
@@ -80,10 +75,17 @@ func (s *Server) handleCredentialsSet(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, credentialsSetResponse{Set: setKeys})
 }
 
+// credentialEntry is the metadata of a stored credential. Stored values are
+// write-only for every role, including the owner: no read endpoint returns
+// one. Value is never populated (it stays in the type so existing clients
+// decode an absent field rather than fail).
 type credentialEntry struct {
 	Key              string  `json:"key"`
 	Type             string  `json:"type,omitempty"`
 	Value            string  `json:"value,omitempty"`
+	Hint             string  `json:"hint,omitempty"`
+	Version          uint64  `json:"version,omitempty"`
+	UpdatedAt        string  `json:"updated_at,omitempty"`
 	ConnectedAt      *string `json:"connected_at,omitempty"`
 	LastRefreshedAt  *string `json:"last_refreshed_at,omitempty"`
 	LastRefreshError *string `json:"last_refresh_error,omitempty"`
@@ -147,17 +149,7 @@ func (s *Server) handleCredentialsList(w http.ResponseWriter, r *http.Request) {
 			jsonError(w, http.StatusNotFound, fmt.Sprintf("Credential %q not found", keyFilter))
 			return
 		}
-		entry := credentialEntry{Key: cred.Key, Type: cred.Type}
-		if cred.Type == "oauth" && len(cred.Ciphertext) == 0 {
-			entry.Value = ""
-		} else {
-			plaintext, err := crypto.Decrypt(cred.Ciphertext, cred.Nonce, s.encKey)
-			if err != nil {
-				jsonError(w, http.StatusInternalServerError, "Failed to decrypt credential")
-				return
-			}
-			entry.Value = string(plaintext)
-		}
+		entry := credentialMetadata(cred)
 		if cred.Type == "oauth" {
 			s.enrichOAuthEntry(ctx, ns.ID, &entry)
 		}
@@ -179,20 +171,7 @@ func (s *Server) handleCredentialsList(w http.ResponseWriter, r *http.Request) {
 	isMember := s.isMemberOrAbove(r, ns.ID)
 	for i, cred := range creds {
 		keys[i] = cred.Key
-		entries[i] = credentialEntry{Key: cred.Key, Type: cred.Type}
-
-		if reveal {
-			if cred.Type == "oauth" && len(cred.Ciphertext) == 0 {
-				entries[i].Value = ""
-			} else {
-				plaintext, err := crypto.Decrypt(cred.Ciphertext, cred.Nonce, s.encKey)
-				if err != nil {
-					jsonError(w, http.StatusInternalServerError, "Failed to decrypt credential")
-					return
-				}
-				entries[i].Value = string(plaintext)
-			}
-		}
+		entries[i] = credentialMetadata(&cred)
 
 		if cred.Type == "oauth" && isMember {
 			s.enrichOAuthEntry(ctx, ns.ID, &entries[i])
@@ -206,11 +185,8 @@ func (s *Server) handleCredentialsList(w http.ResponseWriter, r *http.Request) {
 	if isMember {
 		for _, d := range s.enumerateDynamicCredentials(ctx, ns.ID) {
 			keys = append(keys, d.Key)
-			entry := credentialEntry{Key: d.Key, Type: credentialTypeDynamic, Unavailable: d.Unavailable}
-			if reveal && !d.Unavailable {
-				entry.Value = d.Value
-			}
-			entries = append(entries, entry)
+			// Leased values are write-only too: metadata only.
+			entries = append(entries, credentialEntry{Key: d.Key, Type: credentialTypeDynamic, Unavailable: d.Unavailable})
 		}
 	}
 
@@ -248,7 +224,7 @@ func (s *Server) revealDynamicCredential(ctx context.Context, vaultID, key strin
 	if s.infisicalDynamic == nil {
 		return credentialEntry{}, false
 	}
-	val, ok, err := s.infisicalDynamic.Resolve(ctx, vaultID, key)
+	_, ok, err := s.infisicalDynamic.Resolve(ctx, vaultID, key)
 	if err != nil || !ok {
 		if err != nil {
 			s.logger.Warn("resolving dynamic secret for reveal failed",
@@ -256,7 +232,8 @@ func (s *Server) revealDynamicCredential(ctx context.Context, vaultID, key strin
 		}
 		return credentialEntry{}, false
 	}
-	return credentialEntry{Key: key, Type: credentialTypeDynamic, Value: val}, true
+	// Write-only: the leased value is never returned, only its metadata.
+	return credentialEntry{Key: key, Type: credentialTypeDynamic}, true
 }
 
 func (s *Server) enrichOAuthEntry(ctx context.Context, vaultID string, entry *credentialEntry) {
@@ -273,7 +250,8 @@ func (s *Server) enrichOAuthEntry(ctx context.Context, vaultID string, entry *cr
 		entry.LastRefreshedAt = &t
 	}
 	if co.LastRefreshError != "" {
-		entry.LastRefreshError = &co.LastRefreshError
+		msg := safeRefreshError(co.LastRefreshError)
+		entry.LastRefreshError = &msg
 	}
 	if co.AuthorizationURL != "" {
 		entry.AuthorizationURL = &co.AuthorizationURL
@@ -302,6 +280,37 @@ func (s *Server) enrichOAuthEntry(ctx context.Context, vaultID string, entry *cr
 		s := oauthSecretSentinel
 		entry.RefreshToken = &s
 	}
+}
+
+// credentialMetadata describes a stored credential without its value: the
+// masked hint carries only the value's length, derived from the ciphertext
+// size (AES-GCM adds a 16-byte tag) so nothing is decrypted.
+func credentialMetadata(cred *store.Credential) credentialEntry {
+	e := credentialEntry{Key: cred.Key, Type: cred.Type, Version: cred.Version}
+	if !cred.UpdatedAt.IsZero() {
+		e.UpdatedAt = cred.UpdatedAt.UTC().Format(time.RFC3339)
+	}
+	if n := len(cred.Ciphertext) - 16; n >= 0 && len(cred.Ciphertext) > 0 {
+		e.Hint = fmt.Sprintf("%s (%d chars)", oauthSecretSentinel, n)
+	}
+	return e
+}
+
+// putCredentialValue seals value for the row's next version and writes it
+// with compare-and-set, retrying when a concurrent write moved the version.
+func (s *Server) putCredentialValue(ctx context.Context, vaultID, key string, value []byte) error {
+	for attempt := 0; attempt < 5; attempt++ {
+		next := s.credentialVersion(ctx, vaultID, key) + 1
+		ct, nonce, err := store.CredentialValueAAD(vaultID, key, next).Seal(value, s.encKey)
+		if err != nil {
+			return err
+		}
+		_, err = s.store.SetCredentialVersion(ctx, vaultID, key, ct, nonce, next)
+		if !errors.Is(err, store.ErrVersionConflict) {
+			return err
+		}
+	}
+	return store.ErrVersionConflict
 }
 
 func (s *Server) isMemberOrAbove(r *http.Request, vaultID string) bool {

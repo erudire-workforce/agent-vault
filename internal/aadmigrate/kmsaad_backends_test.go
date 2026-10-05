@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // Store backends for the kmsaad tests. The deployment target is a dedicated
 // Postgres instance (20260617143022_postgres_baseline.go); SQLite is kept as a
 // second backend because upstream still ships it. Each test runs once per

@@ -41,6 +41,9 @@ var masterPasswordSetCmd = &cobra.Command{
 		if record == nil {
 			return fmt.Errorf("no master key record found — run 'agent-vault server' first")
 		}
+		if err := refuseMasterPasswordOnKMS(record); err != nil {
+			return err
+		}
 		if record.DEKPlaintext == nil {
 			return fmt.Errorf("instance already has a master password — use 'agent-vault master-password change' instead")
 		}
@@ -113,6 +116,9 @@ var masterPasswordChangeCmd = &cobra.Command{
 		}
 		if record == nil {
 			return fmt.Errorf("no master key record found — run 'agent-vault server' first")
+		}
+		if err := refuseMasterPasswordOnKMS(record); err != nil {
+			return err
 		}
 		if record.DEKCiphertext == nil {
 			return fmt.Errorf("instance has no master password — use 'agent-vault master-password set' instead")
@@ -192,6 +198,9 @@ var masterPasswordRemoveCmd = &cobra.Command{
 		if record == nil {
 			return fmt.Errorf("no master key record found — run 'agent-vault server' first")
 		}
+		if err := refuseMasterPasswordOnKMS(record); err != nil {
+			return err
+		}
 		if record.DEKCiphertext == nil {
 			return fmt.Errorf("instance already has no master password")
 		}
@@ -230,6 +239,18 @@ var masterPasswordRemoveCmd = &cobra.Command{
 		fmt.Fprintln(cmd.OutOrStderr(), "Security now depends on filesystem access controls.")
 		return nil
 	},
+}
+
+// refuseMasterPasswordOnKMS stops set/change/remove on a KMS instance: the
+// DEK is wrapped by KMS, and "remove" would write it back to dek_plaintext.
+func refuseMasterPasswordOnKMS(record *store.MasterKeyRecord) error {
+	if len(record.KMSWrappedDEK) > 0 {
+		return fmt.Errorf("this instance's master key is wrapped by KMS; master-password commands are disabled")
+	}
+	if err := refuseIfKMSRequired(); err != nil {
+		return fmt.Errorf("master-password commands are disabled: %w", err)
+	}
+	return nil
 }
 
 // ensureServerStopped checks that no server process is running.

@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // Package kmscontract_test pins the KMS key-wrapping API the patch must add
 // to internal/auth and internal/store. It is a separate directory so the
 // expected pre-patch compile failure ("undefined: auth.SetupWithKMS" ...) does

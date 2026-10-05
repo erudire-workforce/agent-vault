@@ -47,14 +47,43 @@ type RefreshConfig struct {
 }
 
 // TokenError is returned when the token endpoint responds with a non-2xx status.
+//
+// Token endpoints echo request fields (authorization code, client secret,
+// refresh token) in their error bodies, and this error ends up in logs, in
+// credential_oauth.last_refresh_error and in redirect URLs. So the raw body
+// is never kept: Body holds only the RFC 6749 "error" code when it is one of
+// the registered values, and is empty otherwise.
 type TokenError struct {
 	StatusCode int
-	Body       string
+	Body       string // sanitized RFC 6749 error code, never the raw response body
 	Permanent  bool
 }
 
 func (e *TokenError) Error() string {
-	return fmt.Sprintf("oauth: token endpoint returned %d: %s", e.StatusCode, e.Body)
+	if e.Body == "" {
+		return fmt.Sprintf("oauth: token endpoint returned %d", e.StatusCode)
+	}
+	return fmt.Sprintf("oauth: token endpoint returned %d (%s)", e.StatusCode, e.Body)
+}
+
+// rfc6749ErrorCodes are the token-endpoint error codes of RFC 6749 §5.2 plus
+// the common extension "invalid_token"; anything else is dropped.
+var rfc6749ErrorCodes = map[string]bool{
+	"invalid_request": true, "invalid_client": true, "invalid_grant": true,
+	"unauthorized_client": true, "unsupported_grant_type": true, "invalid_scope": true,
+	"invalid_token": true, "access_denied": true, "server_error": true, "temporarily_unavailable": true,
+}
+
+// sanitizedErrorCode extracts the "error" member of a JSON error body when it
+// is a registered code. error_description and every other field are dropped.
+func sanitizedErrorCode(body []byte) string {
+	var e struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(body, &e) != nil || !rfc6749ErrorCodes[e.Error] {
+		return ""
+	}
+	return e.Error
 }
 
 // IsPermanentError returns true for 4xx status codes that are not transient.
@@ -177,7 +206,7 @@ func doTokenRequest(req *http.Request) (*TokenResponse, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, &TokenError{
 			StatusCode: resp.StatusCode,
-			Body:       string(body),
+			Body:       sanitizedErrorCode(body),
 			Permanent:  IsPermanentError(resp.StatusCode),
 		}
 	}

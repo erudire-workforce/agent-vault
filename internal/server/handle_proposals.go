@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -191,29 +192,37 @@ func (s *Server) handleProposalCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Encrypt agent-provided credential values (skip delete-action slots).
-	encCredentials := make(map[string]store.EncryptedCredential)
+	// Collect agent-provided credential values (skip delete-action slots).
+	// They are sealed inside the store transaction, once the proposal id
+	// (part of each value's AAD) is known.
+	plainCredentials := make(map[string][]byte)
 	for i := range req.Credentials {
 		if req.Credentials[i].Action == proposal.ActionDelete {
 			continue
 		}
 		if req.Credentials[i].Value != nil && *req.Credentials[i].Value != "" {
-			ct, nonce, err := crypto.Encrypt([]byte(*req.Credentials[i].Value), s.encKey)
-			if err != nil {
-				jsonError(w, http.StatusInternalServerError, "Encryption failed")
-				return
-			}
-			encCredentials[req.Credentials[i].Key] = store.EncryptedCredential{Ciphertext: ct, Nonce: nonce}
+			plainCredentials[req.Credentials[i].Key] = []byte(*req.Credentials[i].Value)
 			// Replace value with nil in the metadata and mark has_value.
 			req.Credentials[i].Value = nil
 			req.Credentials[i].HasValue = true
 		}
 	}
+	seal := func(proposalID int) (map[string]store.EncryptedCredential, error) {
+		out := make(map[string]store.EncryptedCredential, len(plainCredentials))
+		for key, pt := range plainCredentials {
+			ct, nonce, err := store.ProposalCredentialAAD(vaultID, proposalID, key, 1).Seal(pt, s.encKey)
+			if err != nil {
+				return nil, err
+			}
+			out[key] = store.EncryptedCredential{Ciphertext: ct, Nonce: nonce, Version: 1}
+		}
+		return out, nil
+	}
 
 	servicesJSON, _ := json.Marshal(req.Services)
 	credentialsJSON, _ := json.Marshal(req.Credentials)
 
-	cs, err := s.store.CreateProposal(ctx, vaultID, sess.ID, string(servicesJSON), string(credentialsJSON), req.Message, req.UserMessage, encCredentials)
+	cs, err := s.store.CreateProposalWithSealer(ctx, vaultID, sess.ID, string(servicesJSON), string(credentialsJSON), req.Message, req.UserMessage, seal)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "Failed to create proposal")
 		return
@@ -479,7 +488,9 @@ func (s *Server) handleAdminProposalApprove(w http.ResponseWriter, r *http.Reque
 				jsonError(w, http.StatusBadRequest, fmt.Sprintf("Agent-provided credential %q not found in proposal", slot.Key))
 				return
 			}
-			decrypted, err := crypto.Decrypt(enc.Ciphertext, enc.Nonce, s.encKey)
+			// Bound to (vault, proposal id, key, version): a ciphertext copied
+			// from another proposal or from a credentials row fails here.
+			decrypted, err := store.ProposalCredentialAAD(ns.ID, cs.ID, slot.Key, enc.Version).Open(enc.Ciphertext, enc.Nonce, s.encKey)
 			if err != nil {
 				jsonError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to decrypt agent-provided credential %q", slot.Key))
 				return
@@ -496,12 +507,14 @@ func (s *Server) handleAdminProposalApprove(w http.ResponseWriter, r *http.Reque
 			return
 		}
 
-		ct, nonce, err := crypto.Encrypt([]byte(plaintext), s.encKey)
+		// ApplyProposal writes each value with compare-and-set at this version.
+		next := s.credentialVersion(ctx, ns.ID, slot.Key) + 1
+		ct, nonce, err := store.CredentialValueAAD(ns.ID, slot.Key, next).Seal([]byte(plaintext), s.encKey)
 		if err != nil {
 			jsonError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to encrypt credential %q", slot.Key))
 			return
 		}
-		finalCredentials[slot.Key] = store.EncryptedCredential{Ciphertext: ct, Nonce: nonce}
+		finalCredentials[slot.Key] = store.EncryptedCredential{Ciphertext: ct, Nonce: nonce, Version: next}
 	}
 
 	// MergeServices requires non-empty Name on both sides; normalize
@@ -539,6 +552,10 @@ func (s *Server) handleAdminProposalApprove(w http.ResponseWriter, r *http.Reque
 
 	// Apply atomically.
 	if err := s.store.ApplyProposal(ctx, ns.ID, cs.ID, string(mergedJSON), finalCredentials, deleteCredentialKeys, oauthConfigs); err != nil {
+		if errors.Is(err, store.ErrVersionConflict) {
+			jsonError(w, http.StatusConflict, "A credential changed while the proposal was being applied — approve again")
+			return
+		}
 		jsonError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to apply proposal: %v", err))
 		return
 	}

@@ -229,16 +229,3 @@ func (s *Server) checkEmailDomain(ctx context.Context, email string) string {
 	return "signups are restricted to specific email domains"
 }
 
-// isInviteOnly returns true if invite-only registration mode is enabled.
-// Fails closed: returns true on database/parse errors to prevent accidental open registration.
-func (s *Server) isInviteOnly(ctx context.Context) bool {
-	raw, err := s.store.GetSetting(ctx, settingInviteOnly)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false // setting not configured — open registration
-		}
-		fmt.Fprintf(os.Stderr, "[agent-vault] failed to read invite_only setting: %v\n", err)
-		return true // fail closed
-	}
-	return raw == "true"
-}

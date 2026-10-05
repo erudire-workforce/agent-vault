@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/broker"
-	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/oauth"
 	"github.com/Infisical/agent-vault/internal/store"
 )
@@ -186,7 +185,9 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 			return "", fmt.Errorf("credential %q not found", key)
 		}
 
-		plaintext, err := crypto.Decrypt(cred.Ciphertext, cred.Nonce, p.EncKey)
+		// Values are bound to (vault, key, version) through AAD: a ciphertext
+		// copied from another row, vault, field or an older version fails here.
+		plaintext, err := store.CredentialValueAAD(vaultID, key, cred.Version).Open(cred.Ciphertext, cred.Nonce, p.EncKey)
 		if err != nil {
 			return "", fmt.Errorf("failed to decrypt credential %q", key)
 		}
@@ -197,7 +198,7 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 		}
 
 		if cred.Type == "oauth" && p.Refresher != nil && p.OAuthStore != nil {
-			s, err = p.maybeRefreshOAuth(ctx, vaultID, key, s)
+			s, err = p.maybeRefreshOAuth(ctx, vaultID, key, cred.Version, s)
 			if err != nil {
 				return "", err
 			}
@@ -254,7 +255,7 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 
 const oauthRefreshBuffer = 5 * time.Minute
 
-func (p *StoreCredentialProvider) maybeRefreshOAuth(ctx context.Context, vaultID, key, currentToken string) (string, error) {
+func (p *StoreCredentialProvider) maybeRefreshOAuth(ctx context.Context, vaultID, key string, accessVersion uint64, currentToken string) (string, error) {
 	oauthCfg, err := p.OAuthStore.GetCredentialOAuth(ctx, vaultID, key)
 	if err != nil {
 		return currentToken, nil
@@ -273,14 +274,14 @@ func (p *StoreCredentialProvider) maybeRefreshOAuth(ctx context.Context, vaultID
 
 	sfKey := vaultID + "|" + key
 	result := p.Refresher.Do(sfKey, func() oauth.RefreshResult {
-		refreshToken, err := crypto.Decrypt(oauthCfg.RefreshTokenCT, oauthCfg.RefreshTokenNonce, p.EncKey)
+		refreshToken, err := store.OAuthRefreshTokenAAD(vaultID, key, oauthCfg.Version).Open(oauthCfg.RefreshTokenCT, oauthCfg.RefreshTokenNonce, p.EncKey)
 		if err != nil {
 			return oauth.RefreshResult{Err: fmt.Errorf("%w: decrypt refresh token: %v", ErrOAuthRefreshFailed, err)}
 		}
 
 		var clientSecret string
 		if len(oauthCfg.ClientSecretCT) > 0 {
-			cs, err := crypto.Decrypt(oauthCfg.ClientSecretCT, oauthCfg.ClientSecretNonce, p.EncKey)
+			cs, err := store.OAuthClientSecretAAD(vaultID, key, oauthCfg.ClientSecretVersion).Open(oauthCfg.ClientSecretCT, oauthCfg.ClientSecretNonce, p.EncKey)
 			if err != nil {
 				return oauth.RefreshResult{Err: fmt.Errorf("%w: decrypt client secret: %v", ErrOAuthRefreshFailed, err)}
 			}
@@ -297,18 +298,22 @@ func (p *StoreCredentialProvider) maybeRefreshOAuth(ctx context.Context, vaultID
 			TokenAuthMethod: oauthCfg.TokenAuthMethod,
 		})
 		if err != nil {
-			_ = p.OAuthStore.UpdateCredentialOAuthError(ctx, vaultID, key, err.Error())
-			return oauth.RefreshResult{Err: fmt.Errorf("%w: %v", ErrOAuthRefreshFailed, err)}
+			msg := RefreshErrorMessage(err)
+			_ = p.OAuthStore.UpdateCredentialOAuthError(ctx, vaultID, key, msg)
+			return oauth.RefreshResult{Err: fmt.Errorf("%w: %s", ErrOAuthRefreshFailed, msg)}
 		}
 
-		accessCT, accessNonce, err := crypto.Encrypt([]byte(tok.AccessToken), p.EncKey)
+		// The store bumps credentials.version on the access-token write and
+		// credential_oauth.version on a refresh-token write; seal for the
+		// versions the rows will have after the update.
+		accessCT, accessNonce, err := store.CredentialValueAAD(vaultID, key, accessVersion+1).Seal([]byte(tok.AccessToken), p.EncKey)
 		if err != nil {
 			return oauth.RefreshResult{Err: fmt.Errorf("%w: encrypt access token: %v", ErrOAuthRefreshFailed, err)}
 		}
 
 		var newRefreshCT, newRefreshNonce []byte
 		if tok.RefreshToken != "" {
-			newRefreshCT, newRefreshNonce, err = crypto.Encrypt([]byte(tok.RefreshToken), p.EncKey)
+			newRefreshCT, newRefreshNonce, err = store.OAuthRefreshTokenAAD(vaultID, key, oauthCfg.Version+1).Seal([]byte(tok.RefreshToken), p.EncKey)
 			if err != nil {
 				return oauth.RefreshResult{Err: fmt.Errorf("%w: encrypt refresh token: %v", ErrOAuthRefreshFailed, err)}
 			}
@@ -333,4 +338,17 @@ func (p *StoreCredentialProvider) maybeRefreshOAuth(ctx context.Context, vaultID
 		return result.AccessToken, nil
 	}
 	return currentToken, nil
+}
+
+// RefreshErrorMessage is the only text about a failed OAuth token request
+// that may be persisted (credential_oauth.last_refresh_error), logged or
+// returned: token endpoints echo request secrets in their error bodies, so
+// the message is built from the status code and a registered RFC 6749 error
+// code only.
+func RefreshErrorMessage(err error) string {
+	var te *oauth.TokenError
+	if errors.As(err, &te) {
+		return te.Error()
+	}
+	return "oauth: token request failed"
 }
