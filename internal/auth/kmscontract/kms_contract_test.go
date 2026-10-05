@@ -89,7 +89,7 @@ func (f *fakeKMS) Unwrap(_ context.Context, wrapped []byte, keyID string, encCtx
 	return append([]byte(nil), b.dek...), nil
 }
 
-var ctxProd = map[string]string{"service": "agent-vault", "env": "prod"}
+var ctxProd = map[string]string{"service": "agent-vault", "environment": "prod"}
 
 // Known-positive for the fake itself: it must reject a wrong context and a
 // wrong key id, otherwise the tests below could pass vacuously.
@@ -99,7 +99,7 @@ func TestKMSAAD_FakeKMSEnforcesContextAndKeyID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Unwrap(context.Background(), w, kid, map[string]string{"service": "agent-vault", "env": "staging"}); err == nil {
+	if _, err := f.Unwrap(context.Background(), w, kid, map[string]string{"service": "agent-vault", "environment": "staging"}); err == nil {
 		t.Fatal("fake accepted a wrong encryption context")
 	}
 	if _, err := f.Unwrap(context.Background(), w, "key-B", ctxProd); err == nil {
@@ -152,7 +152,7 @@ func TestKMSAAD_UnlockWithKMS_WrongEncryptionContextRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SetupWithKMS: %v", err)
 	}
-	if mk, err := auth.UnlockWithKMS(ctx, f, rec, map[string]string{"service": "agent-vault", "env": "staging"}); err == nil || mk != nil {
+	if mk, err := auth.UnlockWithKMS(ctx, f, rec, map[string]string{"service": "agent-vault", "environment": "staging"}); err == nil || mk != nil {
 		t.Fatal("unlock succeeded with a different encryption context")
 	}
 }
