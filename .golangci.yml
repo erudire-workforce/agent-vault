@@ -50,3 +50,15 @@ linters:
           - gosec
         path: kmsaad_oauth_swap_test\.go
         text: "G120"
+      # internal/server kmsaad suites, untagged on integration: the env
+      # harness keeps a reveal helper that write-only made unused, and the
+      # OAuth log test's local token-endpoint fake parses the form unbounded
+      # and echoes request fields on purpose (providers do).
+      - linters:
+          - unused
+        path: internal/server/kmsaad_env_test\.go
+        text: "func \\(\\*kenv\\)\\.reveal is unused"
+      - linters:
+          - gosec
+        path: internal/server/kmsaad_policy_test\.go
+        text: "G120|G705"
