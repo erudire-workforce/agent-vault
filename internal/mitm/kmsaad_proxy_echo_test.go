@@ -82,7 +82,13 @@ func newRig(t *testing.T, cp brokercore.CredentialProvider) *proxyRig {
 	return rig
 }
 
-func (r *proxyRig) get(t *testing.T, u string) (*http.Response, []byte) {
+// fetched is the closed-body view of a response: status and headers only.
+type fetched struct {
+	StatusCode int
+	Header     http.Header
+}
+
+func (r *proxyRig) get(t *testing.T, u string) (*fetched, []byte) {
 	t.Helper()
 	resp, err := r.client.Get(u)
 	if err != nil {
@@ -90,7 +96,7 @@ func (r *proxyRig) get(t *testing.T, u string) (*http.Response, []byte) {
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
-	return resp, b
+	return &fetched{StatusCode: resp.StatusCode, Header: resp.Header}, b
 }
 
 const identityHeader = "X-Agent-Vault-Credential-Identity"
@@ -217,7 +223,7 @@ func echoUpstream(t *testing.T, rejectToken string) *httptest.Server {
 	return s
 }
 
-func assertScrubbed(t *testing.T, where string, resp *http.Response, body []byte, rig *proxyRig, secrets ...string) {
+func assertScrubbed(t *testing.T, where string, resp *fetched, body []byte, rig *proxyRig, secrets ...string) {
 	t.Helper()
 	var hdr strings.Builder
 	for k, vv := range resp.Header {
