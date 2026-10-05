@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // Package identity does not exist at v0.40.0. It computes the canonical
 // credential identity digest that the fork publishes in
 // X-Agent-Vault-Credential-Identity and that a relying service recomputes.

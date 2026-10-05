@@ -11,7 +11,7 @@ func TestMatchServiceExact(t *testing.T) {
 	services := []Service{
 		{Name: "stripe", Host: "api.stripe.com", Auth: Auth{Type: "bearer", Token: "STRIPE_KEY"}},
 	}
-	r, score := MatchService("api.stripe.com", 0, "/v1/charges", services)
+	r, score := MatchService("GET", "api.stripe.com", 0, "/v1/charges", services)
 	if r == nil {
 		t.Fatal("expected a match")
 	}
@@ -28,7 +28,7 @@ func TestMatchServiceWildcard(t *testing.T) {
 		{Name: "github", Host: "*.github.com", Auth: Auth{Type: "bearer", Token: "GH_TOKEN"}},
 	}
 	for _, host := range []string{"api.github.com", "uploads.github.com"} {
-		r, score := MatchService(host, 0, "/", services)
+		r, score := MatchService("GET", host, 0, "/", services)
 		if r == nil {
 			t.Fatalf("expected match for %s", host)
 		}
@@ -37,7 +37,7 @@ func TestMatchServiceWildcard(t *testing.T) {
 		}
 	}
 	// Should not match bare "github.com"
-	if r, _ := MatchService("github.com", 0, "/", services); r != nil {
+	if r, _ := MatchService("GET", "github.com", 0, "/", services); r != nil {
 		t.Fatal("did not expect match for github.com")
 	}
 }
@@ -46,7 +46,7 @@ func TestMatchServiceNoMatch(t *testing.T) {
 	services := []Service{
 		{Name: "stripe", Host: "api.stripe.com", Auth: Auth{Type: "bearer", Token: "STRIPE_KEY"}},
 	}
-	if r, _ := MatchService("evil.com", 0, "/", services); r != nil {
+	if r, _ := MatchService("GET", "evil.com", 0, "/", services); r != nil {
 		t.Fatal("expected no match")
 	}
 }
@@ -58,11 +58,11 @@ func TestMatchServiceSpecificityWins(t *testing.T) {
 		{Name: "slack-bot", Host: "slack.com", Path: "/api/*", Auth: Auth{Type: "bearer", Token: "SLACK_BOT_TOKEN"}},
 		{Name: "slack-conn", Host: "slack.com", Path: "/api/apps.connections.*", Auth: Auth{Type: "bearer", Token: "SLACK_CONNECTION_TOKEN"}},
 	}
-	r, _ := MatchService("slack.com", 0, "/api/apps.connections.open", services)
+	r, _ := MatchService("GET", "slack.com", 0, "/api/apps.connections.open", services)
 	if r == nil || r.Name != "slack-conn" {
 		t.Fatalf("expected slack-conn (longer literal prefix), got %+v", r)
 	}
-	r, _ = MatchService("slack.com", 0, "/api/chat.postMessage", services)
+	r, _ = MatchService("GET", "slack.com", 0, "/api/chat.postMessage", services)
 	if r == nil || r.Name != "slack-bot" {
 		t.Fatalf("expected slack-bot, got %+v", r)
 	}
@@ -75,7 +75,7 @@ func TestMatchServiceHostExactBeatsWildcardEvenWithShorterPath(t *testing.T) {
 		{Name: "wildcard", Host: "*.slack.com", Path: "/api/apps.connections.*", Auth: Auth{Type: "bearer", Token: "T1"}},
 		{Name: "exact", Host: "api.slack.com", Auth: Auth{Type: "bearer", Token: "T2"}},
 	}
-	r, score := MatchService("api.slack.com", 0, "/api/apps.connections.open", services)
+	r, score := MatchService("GET", "api.slack.com", 0, "/api/apps.connections.open", services)
 	if r == nil || r.Name != "exact" {
 		t.Fatalf("expected exact-host rule to win regardless of path, got %+v", r)
 	}
@@ -89,7 +89,7 @@ func TestMatchServicePathWildcardCrossSlash(t *testing.T) {
 	services := []Service{
 		{Name: "slack-bot", Host: "slack.com", Path: "/api/*", Auth: Auth{Type: "bearer", Token: "T"}},
 	}
-	r, _ := MatchService("slack.com", 0, "/api/foo/bar/baz", services)
+	r, _ := MatchService("GET", "slack.com", 0, "/api/foo/bar/baz", services)
 	if r == nil {
 		t.Fatal("expected /api/* to match /api/foo/bar/baz greedily")
 	}
@@ -101,7 +101,7 @@ func TestMatchServiceDeclarationOrderTiebreak(t *testing.T) {
 		{Name: "first", Host: "*.example.com", Path: "/v1/*", Auth: Auth{Type: "custom", Headers: map[string]string{"X-First": "1"}}},
 		{Name: "second", Host: "*.example.com", Path: "/v1/*", Auth: Auth{Type: "custom", Headers: map[string]string{"X-Second": "2"}}},
 	}
-	r, score := MatchService("api.example.com", 0, "/v1/users", services)
+	r, score := MatchService("GET", "api.example.com", 0, "/v1/users", services)
 	if r == nil || r.Name != "first" {
 		t.Fatalf("expected first service to win on tie, got %+v", r)
 	}
@@ -116,12 +116,12 @@ func TestMatchServiceEmptyPathIsCatchAll(t *testing.T) {
 		{Name: "catchall", Host: "slack.com", Auth: Auth{Type: "bearer", Token: "T2"}},
 	}
 	// Path matches the scoped rule → scoped wins (longer literal prefix).
-	r, _ := MatchService("slack.com", 0, "/api/foo", services)
+	r, _ := MatchService("GET", "slack.com", 0, "/api/foo", services)
 	if r == nil || r.Name != "scoped" {
 		t.Fatalf("expected scoped rule to win when path matches, got %+v", r)
 	}
 	// Path does NOT match the scoped rule → catch-all wins.
-	r, _ = MatchService("slack.com", 0, "/oauth/v2/authorize", services)
+	r, _ = MatchService("GET", "slack.com", 0, "/oauth/v2/authorize", services)
 	if r == nil || r.Name != "catchall" {
 		t.Fatalf("expected catchall rule when scoped path doesn't match, got %+v", r)
 	}
@@ -132,7 +132,7 @@ func TestMatchServicePortStripped(t *testing.T) {
 	services := []Service{
 		{Name: "legacy", Host: "api.stripe.com", Port: &port, Auth: Auth{Type: "bearer", Token: "T"}},
 	}
-	r, _ := MatchService("api.stripe.com", 443, "/v1/charges", services)
+	r, _ := MatchService("GET", "api.stripe.com", 443, "/v1/charges", services)
 	if r == nil {
 		t.Fatal("expected port-specific service to match")
 	}
@@ -1086,7 +1086,7 @@ func TestMatchServicePortExactMatch(t *testing.T) {
 	services := []Service{
 		{Name: "svc", Host: "api.example.com", Port: intPtr(8080), Auth: Auth{Type: "bearer", Token: "T"}},
 	}
-	r, _ := MatchService("api.example.com", 8080, "/", services)
+	r, _ := MatchService("GET", "api.example.com", 8080, "/", services)
 	if r == nil {
 		t.Fatal("expected port-specific service to match when port matches")
 	}
@@ -1096,7 +1096,7 @@ func TestMatchServicePortMismatch(t *testing.T) {
 	services := []Service{
 		{Name: "svc", Host: "api.example.com", Port: intPtr(8080), Auth: Auth{Type: "bearer", Token: "T"}},
 	}
-	r, _ := MatchService("api.example.com", 9090, "/", services)
+	r, _ := MatchService("GET", "api.example.com", 9090, "/", services)
 	if r != nil {
 		t.Fatal("expected no match when port does not match")
 	}
@@ -1106,7 +1106,7 @@ func TestMatchServicePortNilMatchesAny(t *testing.T) {
 	services := []Service{
 		{Name: "svc", Host: "api.example.com", Auth: Auth{Type: "bearer", Token: "T"}},
 	}
-	r, _ := MatchService("api.example.com", 443, "/", services)
+	r, _ := MatchService("GET", "api.example.com", 443, "/", services)
 	if r == nil {
 		t.Fatal("expected Port=nil service to match any target port")
 	}
@@ -1117,7 +1117,7 @@ func TestMatchServicePortSpecificBeatsWildcard(t *testing.T) {
 		{Name: "wildcard-port", Host: "api.example.com", Auth: Auth{Type: "bearer", Token: "T1"}},
 		{Name: "specific-port", Host: "api.example.com", Port: intPtr(3000), Auth: Auth{Type: "bearer", Token: "T2"}},
 	}
-	r, score := MatchService("api.example.com", 3000, "/", services)
+	r, score := MatchService("GET", "api.example.com", 3000, "/", services)
 	if r == nil || r.Name != "specific-port" {
 		t.Fatalf("expected specific-port to win, got %+v", r)
 	}
@@ -1131,7 +1131,7 @@ func TestMatchServicePortSpecificDoesNotOverrideHostTier(t *testing.T) {
 		{Name: "exact-host", Host: "api.example.com", Auth: Auth{Type: "bearer", Token: "T1"}},
 		{Name: "wildcard-host", Host: "*.example.com", Port: intPtr(3000), Auth: Auth{Type: "bearer", Token: "T2"}},
 	}
-	r, _ := MatchService("api.example.com", 3000, "/", services)
+	r, _ := MatchService("GET", "api.example.com", 3000, "/", services)
 	if r == nil || r.Name != "exact-host" {
 		t.Fatalf("expected exact-host to win (host tier beats port specificity), got %+v", r)
 	}
@@ -1142,11 +1142,11 @@ func TestMatchServiceTwoPortsSameHost(t *testing.T) {
 		{Name: "port-3000", Host: "api.example.com", Port: intPtr(3000), Auth: Auth{Type: "bearer", Token: "T1"}},
 		{Name: "port-4000", Host: "api.example.com", Port: intPtr(4000), Auth: Auth{Type: "bearer", Token: "T2"}},
 	}
-	r, _ := MatchService("api.example.com", 3000, "/", services)
+	r, _ := MatchService("GET", "api.example.com", 3000, "/", services)
 	if r == nil || r.Name != "port-3000" {
 		t.Fatalf("expected port-3000 for request to port 3000, got %+v", r)
 	}
-	r, _ = MatchService("api.example.com", 4000, "/", services)
+	r, _ = MatchService("GET", "api.example.com", 4000, "/", services)
 	if r == nil || r.Name != "port-4000" {
 		t.Fatalf("expected port-4000 for request to port 4000, got %+v", r)
 	}

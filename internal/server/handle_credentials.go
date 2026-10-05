@@ -68,6 +68,7 @@ func (s *Server) handleCredentialsSet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setKeys = append(setKeys, key)
+		s.scheduleIdentityProbe(ns.ID, key)
 	}
 
 	actor, _ := s.actorFromSession(r.Context(), sessionFromContext(r.Context()))

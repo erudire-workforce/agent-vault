@@ -99,6 +99,12 @@ var alwaysBlocked = []net.IPNet{
 	parseCIDR("169.254.169.254/32"),
 	// AWS IMDSv2 IPv6
 	parseCIDR("fd00:ec2::254/128"),
+	// ECS/Fargate task metadata and credentials endpoint (task role keys).
+	// Blocked even with AGENT_VAULT_ALLOW_PRIVATE_RANGES or an allowlist
+	// entry: an agent must never reach the vault's own AWS credentials.
+	parseCIDR("169.254.170.2/32"),
+	// ECS task metadata endpoint over IPv6.
+	parseCIDR("fd00:ec2::23/128"),
 }
 
 // privateRanges contains RFC-1918 and other private/reserved ranges.

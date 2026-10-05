@@ -9,7 +9,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Config represents a vault's broker configuration as stored in YAML files.
@@ -27,12 +30,23 @@ type Config struct {
 // Enabled is nullable so persisted services from before the field
 // existed stay live after upgrade — use IsEnabled() rather than
 // dereferencing the pointer.
+//
+// Methods restricts the HTTP methods the service serves. nil keeps the
+// upstream behaviour (any method). A non-nil list is an allowlist
+// compared case-insensitively; an empty non-nil list denies every
+// method. A host+path match whose method is not allowed is a refusal,
+// never a fall-through to the unmatched-host policy.
+//
+// Path may use "*" (greedy, crosses '/', upstream semantics) and the
+// opt-in "{name}" placeholder, which matches exactly one non-empty path
+// segment and must occupy a whole segment.
 type Service struct {
 	Name          string         `yaml:"name" json:"name"`
 	Host          string         `yaml:"host" json:"host"`
 	Path          string         `yaml:"path,omitempty" json:"path,omitempty"`
 	Port          *int           `yaml:"port,omitempty" json:"-"`
 	Enabled       *bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Methods       []string       `yaml:"methods,omitempty" json:"methods,omitempty"` // see Service doc
 	Auth          Auth           `yaml:"auth" json:"auth"`
 	Substitutions []Substitution `yaml:"substitutions,omitempty" json:"substitutions,omitempty"`
 }
@@ -56,7 +70,37 @@ func (s Service) MarshalJSON() ([]byte, error) {
 	a.Host = s.MatcherPattern()
 	a.Path = ""
 	a.Port = nil
-	return json.Marshal(a)
+	// An explicitly empty Methods list means "deny every method"; plain
+	// omitempty would drop it and turn the stored rule into "any method".
+	// The shallower Methods field shadows the embedded one.
+	return json.Marshal(struct {
+		alias
+		Methods *[]string `json:"methods,omitempty"`
+	}{alias: a, Methods: methodsPtr(s.Methods)})
+}
+
+// MarshalYAML keeps an explicitly empty Methods list (deny all) through a
+// YAML round trip for the same reason as MarshalJSON.
+func (s Service) MarshalYAML() (interface{}, error) {
+	type alias Service
+	a := alias(s)
+	var n yaml.Node
+	if err := n.Encode(a); err != nil {
+		return nil, err
+	}
+	if s.Methods != nil && len(s.Methods) == 0 && n.Kind == yaml.MappingNode {
+		n.Content = append(n.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "methods"},
+			&yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq", Style: yaml.FlowStyle})
+	}
+	return &n, nil
+}
+
+func methodsPtr(m []string) *[]string {
+	if m == nil {
+		return nil
+	}
+	return &m
 }
 
 // Substitution declares a placeholder string the broker rewrites with a
@@ -379,8 +423,58 @@ func Validate(cfg *Config) error {
 		if err := s.ValidateSubstitutions(); err != nil {
 			return fmt.Errorf("service %d: %w", i, err)
 		}
+		if err := ValidateMethods(s.Methods); err != nil {
+			return fmt.Errorf("service %d: %w", i, err)
+		}
 	}
 	return nil
+}
+
+// SupportedMethods lists the HTTP methods a service's Methods allowlist
+// may name. Anything else (including CONNECT and TRACE) is refused so a
+// typo cannot silently widen or narrow a rule.
+var SupportedMethods = []string{"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}
+
+// ValidateMethods rejects unknown or duplicate verbs. nil and an empty
+// list are both valid (any method, and deny all, respectively).
+func ValidateMethods(methods []string) error {
+	seen := make(map[string]bool, len(methods))
+	for _, m := range methods {
+		u := strings.ToUpper(strings.TrimSpace(m))
+		known := false
+		for _, s := range SupportedMethods {
+			if u == s {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return fmt.Errorf("methods: unsupported HTTP method %q (supported: %s)", m, strings.Join(SupportedMethods, ", "))
+		}
+		if seen[u] {
+			return fmt.Errorf("methods: %q listed more than once", m)
+		}
+		seen[u] = true
+	}
+	return nil
+}
+
+// AllowsMethod reports whether the service serves method. nil Methods
+// allows any method; otherwise the comparison is case-insensitive and an
+// empty method (unknown) is refused.
+func (s *Service) AllowsMethod(method string) bool {
+	if s.Methods == nil {
+		return true
+	}
+	if method == "" {
+		return false
+	}
+	for _, m := range s.Methods {
+		if strings.EqualFold(strings.TrimSpace(m), method) {
+			return true
+		}
+	}
+	return false
 }
 
 // ValidateSubstitutions checks each substitution for length, character
@@ -552,7 +646,33 @@ const (
 // patterns are both port-stripped. A service with Port=nil matches any
 // targetPort; a service with a specific Port matches only that port.
 // The MatchScore is meaningful only when the returned *Service is non-nil.
-func MatchService(host string, targetPort int, path string, services []Service) (*Service, MatchScore) {
+//
+// Method is checked after selection: the most specific host+path match
+// decides, and if its Methods allowlist does not include method the
+// result is nil. A less specific service is never consulted as a
+// fallback, so adding a narrower read-only rule cannot be bypassed by a
+// broader one. Use MatchServiceDetail to tell "method refused" from "no
+// match".
+func MatchService(method, host string, targetPort int, path string, services []Service) (*Service, MatchScore) {
+	svc, score, _ := MatchServiceDetail(method, host, targetPort, path, services)
+	return svc, score
+}
+
+// MatchServiceDetail is MatchService plus methodDenied, which is true
+// when a service matched host+port+path but does not allow method. The
+// proxy turns that into a 403 rather than the unmatched-host policy.
+func MatchServiceDetail(method, host string, targetPort int, path string, services []Service) (svc *Service, score MatchScore, methodDenied bool) {
+	best, bestScore := matchHostPortPath(host, targetPort, path, services)
+	if best == nil {
+		return nil, MatchScore{}, false
+	}
+	if !best.AllowsMethod(method) {
+		return nil, MatchScore{}, true
+	}
+	return best, bestScore, false
+}
+
+func matchHostPortPath(host string, targetPort int, path string, services []Service) (*Service, MatchScore) {
 	var best *Service
 	var bestScore MatchScore
 	for i := range services {
@@ -624,6 +744,9 @@ func matchPathGlob(pattern, path string) (literalLen int, ok bool) {
 	if pattern == "" {
 		return 0, true
 	}
+	if strings.Contains(pattern, "{") {
+		return matchPlaceholderPattern(pattern, path)
+	}
 	parts := strings.Split(pattern, "*")
 	literalLen = len(parts[0])
 
@@ -647,6 +770,105 @@ func matchPathGlob(pattern, path string) (literalLen int, ok bool) {
 		return literalLen, false
 	}
 	return literalLen, true
+}
+
+// pathToken is one element of a compiled path pattern: a literal run, a
+// greedy "*" (any characters, '/' included — upstream semantics), or a
+// "{name}" placeholder (one or more characters, never '/').
+type pathToken struct {
+	kind byte // 'l' literal, '*' glob, '{' placeholder
+	lit  string
+}
+
+var pathPatternCache sync.Map // pattern -> []pathToken
+
+// placeholderNamePattern is the accepted form of a {name} placeholder.
+var placeholderNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
+
+func compilePathPattern(pattern string) []pathToken {
+	if v, ok := pathPatternCache.Load(pattern); ok {
+		return v.([]pathToken)
+	}
+	var toks []pathToken
+	var lit strings.Builder
+	flush := func() {
+		if lit.Len() > 0 {
+			toks = append(toks, pathToken{kind: 'l', lit: lit.String()})
+			lit.Reset()
+		}
+	}
+	for i := 0; i < len(pattern); i++ {
+		switch c := pattern[i]; c {
+		case '*':
+			flush()
+			toks = append(toks, pathToken{kind: '*'})
+		case '{':
+			end := strings.IndexByte(pattern[i:], '}')
+			if end < 0 {
+				// Malformed; ValidatePath refuses these on write. Treat the
+				// rest as a literal so a stored bad pattern can only match
+				// itself, never widen.
+				lit.WriteString(pattern[i:])
+				i = len(pattern)
+				continue
+			}
+			flush()
+			toks = append(toks, pathToken{kind: '{', lit: pattern[i+1 : i+end]})
+			i += end
+		default:
+			lit.WriteByte(c)
+		}
+	}
+	flush()
+	pathPatternCache.Store(pattern, toks)
+	return toks
+}
+
+// matchPlaceholderPattern matches patterns that contain at least one
+// {name} placeholder. "*" keeps its upstream meaning (greedy across '/');
+// a placeholder matches exactly one non-empty path segment. Dynamic
+// programming over (token, offset) keeps the cost O(len(tokens)*len(path)).
+func matchPlaceholderPattern(pattern, path string) (literalLen int, ok bool) {
+	literalLen = strings.IndexAny(pattern, "*{")
+	toks := compilePathPattern(pattern)
+	n := len(path)
+	// reach[j] = the tokens consumed so far can end exactly at path[:j].
+	reach := make([]bool, n+1)
+	reach[0] = true
+	for _, tk := range toks {
+		next := make([]bool, n+1)
+		if tk.kind == '*' {
+			// Greedy glob: everything at or after the first reachable
+			// offset is reachable.
+			for j := 0; j <= n; j++ {
+				if reach[j] {
+					for k := j; k <= n; k++ {
+						next[k] = true
+					}
+					break
+				}
+			}
+			reach = next
+			continue
+		}
+		for j := 0; j <= n; j++ {
+			if !reach[j] {
+				continue
+			}
+			switch tk.kind {
+			case 'l':
+				if strings.HasPrefix(path[j:], tk.lit) {
+					next[j+len(tk.lit)] = true
+				}
+			case '{':
+				for k := j; k < n && path[k] != '/'; k++ {
+					next[k+1] = true
+				}
+			}
+		}
+		reach = next
+	}
+	return literalLen, reach[n]
 }
 
 // Slugify derives a ValidateSlug-conformant identifier from host+path+port.
@@ -831,6 +1053,19 @@ func ValidatePath(p string) error {
 		switch r {
 		case ' ', '?', '#', '[', ']', '\\', '|', '<', '>', '"':
 			return fmt.Errorf("path %q must not contain %q", p, r)
+		}
+	}
+	if strings.ContainsAny(p, "{}") {
+		// Opt-in single-segment placeholders: each "{name}" must be a
+		// whole path segment so it can never straddle a '/'.
+		for _, seg := range strings.Split(p, "/") {
+			if !strings.ContainsAny(seg, "{}") {
+				continue
+			}
+			if len(seg) < 3 || seg[0] != '{' || seg[len(seg)-1] != '}' ||
+				!placeholderNamePattern.MatchString(seg[1:len(seg)-1]) {
+				return fmt.Errorf("path %q: placeholder segment %q must be a whole segment of the form {name}", p, seg)
+			}
 		}
 	}
 	return nil

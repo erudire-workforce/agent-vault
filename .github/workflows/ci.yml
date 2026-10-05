@@ -4,8 +4,9 @@ on:
   pull_request:
     branches: [main]
   push:
-    # claude/** : fork work branches get the full suite before a PR exists.
+    # Fork work branches run the full suite on push (no PR needed).
     branches: [main, 'claude/**']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -126,6 +127,65 @@ jobs:
           go test -race -count=1 -tags kmsaad ./internal/server
           -run 'TestKMSAAD_(API_|WriteOnly_|RegisterRefusedOnceAUserExists|RequireTokenExpiry_|CredentialStoreSwitchingDisabled|NoSecretInLogs_|LogScanner_KnownPositive|ExecutorTokenPrivilegeChecks)'
 
+  # Fork policy tests (proxy rules, echo scrubbing, identity header,
+  # whoami, netguard, declarative bootstrap) against both store backends.
+  # The postgres subtests are required here, not skipped.
+  go-test-proxy-policy:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      AGENT_VAULT_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:55432/postgres?sslmode=disable
+      AGENT_VAULT_TEST_REQUIRE_POSTGRES: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Stub webdist for go:embed
+        run: |
+          mkdir -p internal/server/webdist
+          printf '<!doctype html><title>ci-stub</title>' > internal/server/webdist/index.html
+
+      - name: Untagged fork packages (postgres required)
+        run: go test -race -count=1 -v ./internal/bootstrap/... ./internal/netguard/ ./internal/identity/ ./internal/scrub/ ./internal/servicepolicy/ ./internal/telemetry/
+
+      # Tagged (kmsaad) tests in this branch's scope. Excluded on purpose:
+      # TestKMSAAD_Wildcard_SingleSegmentOnly, TestKMSAAD_Wildcard_MiddleSegment
+      # and TestKMSAAD_MatchService_SingleSegmentWildcard, which assume "*"
+      # became single-segment; this branch keeps upstream "*" semantics and
+      # adds the opt-in {name} placeholder instead (see the branch report).
+      - name: Tagged proxy rule, echo and identity tests
+        run: >-
+          go test -race -count=1 -tags kmsaad ./internal/mitm/
+          -run 'TestKMSAAD_(RetryPath_IdentityDescribesFinalCredential|PathNormalization_MatchesWhatIsForwarded|EchoScrub_ResponseHeadersBodyAndLogs|EchoScrub_RetryPath|WriteHold_PatchPagesRefused_GetAllowed|WriteHold_EmptyMethodsDeniesAll|HeaderHygiene_SpoofedIdentityStripped)$' -v
+
+      - name: Tagged method contract tests
+        run: >-
+          go test -race -count=1 -tags kmsaad ./internal/broker/methodcontract/
+          -run 'TestKMSAAD_(MatchService_MethodAllowlist|MatchService_NilMethodsKeepsUpstreamBehaviour|MatchService_EmptyMethodsDeniesAll|MethodsRoundTripJSON|ValidateMethodsRejectsUnknownVerbs)$' -v
+
+      - name: Tagged whoami and executor privilege tests
+        run: >-
+          go test -race -count=1 -tags kmsaad ./internal/server/
+          -run 'TestKMSAAD_(ProxyWhoami|ExecutorTokenPrivilegeChecks)$' -v
+
   # Security-critical: always run on every PR (see go-test for rationale).
   go-lint:
     runs-on: ubuntu-latest
@@ -207,7 +267,7 @@ jobs:
   # required check blocks merging.
   ci-summary:
     if: always()
-    needs: [changes, frontend-build, go-test, go-lint, go-mod-tidy, sdk-ts]
+    needs: [changes, frontend-build, go-test, go-test-proxy-policy, go-lint, go-mod-tidy, sdk-ts]
     runs-on: ubuntu-latest
     steps:
       - name: Verify required jobs
@@ -215,6 +275,7 @@ jobs:
           CHANGES: ${{ needs.changes.result }}
           FRONTEND_BUILD: ${{ needs.frontend-build.result }}
           GO_TEST: ${{ needs.go-test.result }}
+          GO_TEST_PROXY_POLICY: ${{ needs.go-test-proxy-policy.result }}
           GO_LINT: ${{ needs.go-lint.result }}
           GO_MOD_TIDY: ${{ needs.go-mod-tidy.result }}
           SDK_TS: ${{ needs.sdk-ts.result }}
@@ -233,6 +294,7 @@ jobs:
           fi
           check frontend-build "$FRONTEND_BUILD"
           check go-test        "$GO_TEST"
+          check go-test-proxy-policy "$GO_TEST_PROXY_POLICY"
           check go-lint        "$GO_LINT"
           check go-mod-tidy    "$GO_MOD_TIDY"
           check sdk-ts         "$SDK_TS"

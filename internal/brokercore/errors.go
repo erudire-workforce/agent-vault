@@ -43,6 +43,21 @@ var (
 	// configured". Callers surface 403 with error code "service_disabled".
 	ErrServiceDisabled = errors.New("brokercore: broker service is disabled")
 
+	// ErrMethodNotAllowed means a service matched host+port+path but its
+	// Methods allowlist does not include the request method. Callers
+	// surface 403 and never fall through to the unmatched-host policy.
+	ErrMethodNotAllowed = errors.New("brokercore: method not allowed by the matched broker service")
+
+	// ErrNonCanonicalPath means the request path carries an encoded
+	// slash, a dot segment, an empty segment or another form that would
+	// make the matched path differ from what the upstream interprets.
+	// Callers surface 400.
+	ErrNonCanonicalPath = errors.New("brokercore: request path is not in canonical form")
+
+	// ErrServicePolicy means the matched service violates the
+	// compiled-in service policy (servicepolicy). Callers surface 403.
+	ErrServicePolicy = errors.New("brokercore: matched broker service is outside the compiled-in service policy")
+
 	// ErrOAuthNotConnected means the credential is an OAuth type but
 	// the consent flow hasn't completed yet (no access token stored).
 	ErrOAuthNotConnected = errors.New("brokercore: oauth credential not yet connected")

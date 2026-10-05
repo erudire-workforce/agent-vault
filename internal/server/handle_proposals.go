@@ -544,6 +544,9 @@ func (s *Server) handleAdminProposalApprove(w http.ResponseWriter, r *http.Reque
 	}
 
 	merged, _ := proposal.MergeServices(existingServices, proposedServices)
+	if !writeServicePolicyError(w, merged) {
+		return
+	}
 	mergedJSON, err := json.Marshal(merged)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "Failed to marshal merged services")
@@ -558,6 +561,9 @@ func (s *Server) handleAdminProposalApprove(w http.ResponseWriter, r *http.Reque
 		}
 		jsonError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to apply proposal: %v", err))
 		return
+	}
+	for key := range finalCredentials {
+		s.scheduleIdentityProbe(ns.ID, key)
 	}
 
 	jsonOK(w, map[string]interface{}{

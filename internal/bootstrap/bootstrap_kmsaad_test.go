@@ -1,5 +1,3 @@
-//go:build kmsaad
-
 // Package bootstrap does not exist at v0.40.0 (fork: declarative bootstrap,
 // token delivery and rotation). These tests pin its contract; until the package is
 // written they fail to compile ("undefined: Apply" ...), confined to this

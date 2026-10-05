@@ -28,6 +28,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/server"
 	"github.com/Infisical/agent-vault/internal/session"
 	"github.com/Infisical/agent-vault/internal/store"
+	"github.com/Infisical/agent-vault/internal/servicepolicy"
 	"github.com/Infisical/agent-vault/internal/telemetry"
 	"github.com/spf13/cobra"
 )
@@ -221,6 +222,7 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 		fmt.Fprintf(os.Stderr, "warning: transparent proxy disabled (CA init failed: %v); pass --mitm-port 0 to suppress\n", err)
 		return nil
 	}
+	mitmRootPEM = caProv.RootPEM
 	srv.AttachMITM(mitm.New(
 		net.JoinHostPort(host, strconv.Itoa(mitmPort)),
 		mitm.Options{
@@ -241,7 +243,13 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 // attachServerExtensions wires optional subsystems (MITM, Infisical) onto srv.
 // Both bootstrap paths (foreground and detached child) call this.
 func attachServerExtensions(srv *server.Server, host string, mitmPort int, masterKey []byte, db store.Store, logger *slog.Logger, maxRespBytes, maxReqBytes int64) error {
+	if err := servicepolicy.ValidateEnv(); err != nil {
+		return err
+	}
 	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, db, maxRespBytes, maxReqBytes); err != nil {
+		return err
+	}
+	if err := startDeclarativeBootstrapIfConfigured(db, logger); err != nil {
 		return err
 	}
 	attachInfisicalIfConfigured(srv, logger)
@@ -778,6 +786,11 @@ var stopCmd = &cobra.Command{
 }
 
 func captureServerStart(mitmPort int, dbBackend string) {
+	// Telemetry is opt-in (see telemetry.IsDisabled); without it, do not
+	// even read the machine ID or the local session.
+	if tel == nil {
+		return
+	}
 	distinctID := telemetry.MachineID()
 	if sess, _ := session.Load(); sess != nil && sess.Email != "" {
 		distinctID = sess.Email

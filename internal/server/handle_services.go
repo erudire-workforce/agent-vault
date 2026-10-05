@@ -422,6 +422,10 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 		upserted = append(upserted, svc.Name)
 	}
 
+	if !writeServicePolicyError(w, existing) {
+		return
+	}
+
 	servicesJSON, err := json.Marshal(existing)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "Failed to marshal services")
@@ -583,6 +587,9 @@ func (s *Server) handleServicePatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	services[idx].Enabled = req.Enabled
+	if *req.Enabled && !writeServicePolicyError(w, services[idx:idx+1]) {
+		return
+	}
 
 	servicesJSON, err := json.Marshal(services)
 	if err != nil {
@@ -640,6 +647,9 @@ func (s *Server) handleServicesSet(w http.ResponseWriter, r *http.Request) {
 	cfg := broker.Config{Vault: name, Services: services}
 	if err := broker.Validate(&cfg); err != nil {
 		jsonError(w, http.StatusBadRequest, fmt.Sprintf("Invalid services: %v", err))
+		return
+	}
+	if !writeServicePolicyError(w, services) {
 		return
 	}
 

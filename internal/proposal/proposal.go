@@ -48,6 +48,7 @@ type Service struct {
 	Path          string                `json:"path,omitempty"`
 	Port          *int                  `json:"-"`
 	Enabled       *bool                 `json:"enabled,omitempty"`
+	Methods       *[]string             `json:"methods,omitempty"` // nil on update keeps the existing allowlist; pointer keeps an explicit [] (deny all)
 	Auth          *broker.Auth          `json:"auth,omitempty"`
 	Substitutions []broker.Substitution `json:"substitutions,omitempty"`
 }

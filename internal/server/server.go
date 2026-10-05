@@ -192,6 +192,7 @@ func (s *Server) CredentialProvider() brokercore.CredentialProvider {
 	// time, before Start() builds s.infisicalDynamic. The adapter reads the
 	// field per request, so resolution works regardless of init order.
 	p.Dynamic = lateDynamicResolver{s}
+	p.OnCredentialRefreshed = s.scheduleIdentityProbe
 	return p
 }
 
