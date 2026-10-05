@@ -131,7 +131,7 @@ func CheckService(s broker.Service) error {
 	if len(s.Substitutions) > 0 {
 		return fmt.Errorf("%w: substitutions are not allowed", ErrRefused)
 	}
-	if s.Methods == nil || len(s.Methods) == 0 {
+	if len(s.Methods) == 0 {
 		return fmt.Errorf("%w: %s services must list their methods explicitly", ErrRefused, prov.Name)
 	}
 	if path == "" {

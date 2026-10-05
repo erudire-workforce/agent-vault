@@ -273,7 +273,9 @@ func (sw *Writer) Write(p []byte) (int, error) {
 		}
 		return n, err
 	}
-	buf := append(sw.carry, p...)
+	buf := make([]byte, 0, len(sw.carry)+len(p))
+	buf = append(buf, sw.carry...)
+	buf = append(buf, p...)
 	out, tail := sw.sc.process(buf, false)
 	sw.carry = append([]byte(nil), tail...)
 	if len(out) > 0 {

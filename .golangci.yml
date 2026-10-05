@@ -33,3 +33,10 @@ linters:
       - linters:
           - errcheck
         path: _test\.go
+      # The shared test-store helper (copied into each package that runs
+      # the kmsaad suites) reads every row of a table named by the test
+      # itself to scan for planted sentinels; the name is never input.
+      - linters:
+          - gosec
+        path: kmsaad_backends_test\.go
+        text: G202
