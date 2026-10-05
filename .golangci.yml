@@ -33,3 +33,20 @@ linters:
       - linters:
           - errcheck
         path: _test\.go
+      # Shared kmsaad test harness: kmsaad_backends_test.go is copied verbatim
+      # into every package that runs store-backed tests (so some copies leave
+      # helpers unused) and builds SQL from literal table names in test code;
+      # the OAuth swap test runs a local token-endpoint fake. Scoped to those
+      # test files and those findings only.
+      - linters:
+          - unused
+        path: kmsaad_backends_test\.go
+        text: "func testDB.fresh is unused"
+      - linters:
+          - gosec
+        path: kmsaad_backends_test\.go
+        text: "G202"
+      - linters:
+          - gosec
+        path: kmsaad_oauth_swap_test\.go
+        text: "G120"
