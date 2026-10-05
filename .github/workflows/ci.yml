@@ -138,7 +138,7 @@ jobs:
           printf '<!doctype html><title>ci-stub</title>' > internal/server/webdist/index.html
 
       - name: Untagged fork packages (postgres required)
-        run: go test -race -count=1 ./internal/bootstrap/... ./internal/netguard/ ./internal/identity/ ./internal/scrub/ ./internal/servicepolicy/ ./internal/telemetry/
+        run: go test -race -count=1 -v ./internal/bootstrap/... ./internal/netguard/ ./internal/identity/ ./internal/scrub/ ./internal/servicepolicy/ ./internal/telemetry/
 
       # Tagged (kmsaad) tests in this branch's scope. Excluded on purpose:
       # TestKMSAAD_Wildcard_SingleSegmentOnly, TestKMSAAD_Wildcard_MiddleSegment
