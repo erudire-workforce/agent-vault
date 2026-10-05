@@ -50,6 +50,20 @@ type Credential struct {
 	UpdatedAt time.Time
 }
 
+// credentialIdentityPrefix prefixes the vault_settings key that holds a
+// credential's recorded identity ("<credential version>:<digest>").
+// replaceCredentialsTx repeats it as a SQL literal; keep the two in step.
+const credentialIdentityPrefix = "credential_identity:"
+
+// CredentialIdentitySettingKey is the vault_settings key holding the
+// recorded identity digest for credential key, beside the credential
+// version it was recorded for. The store deletes it whenever the
+// credential row is deleted, so a recreated row (whose version restarts)
+// never inherits it.
+func CredentialIdentitySettingKey(credentialKey string) string {
+	return credentialIdentityPrefix + credentialKey
+}
+
 // CredentialOAuth stores the OAuth configuration and refresh state for
 // an OAuth-type credential. The access token lives in credentials.ciphertext;
 // this table stores everything needed to refresh it.

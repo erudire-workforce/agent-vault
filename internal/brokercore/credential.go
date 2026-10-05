@@ -2,14 +2,13 @@ package brokercore
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -68,7 +67,7 @@ type InjectResult struct {
 	CredentialIdentity string
 
 	// ProbeBinding is set only for WithProbeService calls: the
-	// CiphertextBinding of the single stored value that was injected, or
+	// VersionBinding of the single stored value that was injected, or
 	// "" when the value was not a plain stored credential (dynamic, or
 	// refreshed during the call). The probe records its digest under this
 	// binding, never under a binding read separately.
@@ -212,9 +211,9 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 	// Memoize per-key lookups so a credential shared by auth and a
 	// substitution decrypts only once.
 	cache := make(map[string]string)
-	// storedDigest binds each static value to the exact ciphertext row it
-	// came from, so a recorded identity is used only for that value.
-	storedDigest := make(map[string]string)
+	// storedVersion binds each static value to the credential version it
+	// was sealed for, so a recorded identity is used only for that value.
+	storedVersion := make(map[string]string)
 	getCredential := func(key string) (string, error) {
 		if v, ok := cache[key]; ok {
 			return v, nil
@@ -245,7 +244,7 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 			return "", fmt.Errorf("%w: credential %q", ErrOAuthNotConnected, key)
 		}
 
-		storedDigest[key] = CiphertextBinding(cred.Ciphertext)
+		storedVersion[key] = VersionBinding(cred.Version)
 		if cred.Type == "oauth" && p.Refresher != nil && p.OAuthStore != nil {
 			refreshed, err := p.maybeRefreshOAuth(ctx, vaultID, key, cred.Version, s)
 			if err != nil {
@@ -254,7 +253,7 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 			if refreshed != s {
 				// A new access token was minted: the recorded identity was
 				// bound to the old value. Re-probe in the background.
-				delete(storedDigest, key)
+				delete(storedVersion, key)
 				if p.OnCredentialRefreshed != nil {
 					go p.OnCredentialRefreshed(vaultID, key)
 				}
@@ -308,10 +307,10 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 
 	result.Headers = headers
 	result.Substitutions = resolvedSubs
-	result.CredentialIdentity = p.recordedIdentity(ctx, vaultID, matched.Auth.CredentialKeys(), storedDigest)
+	result.CredentialIdentity = p.recordedIdentity(ctx, vaultID, matched.Auth.CredentialKeys(), storedVersion)
 	if probe != nil {
 		if keys := matched.Auth.CredentialKeys(); len(keys) == 1 {
-			result.ProbeBinding = storedDigest[keys[0]]
+			result.ProbeBinding = storedVersion[keys[0]]
 		}
 	}
 	return result, nil
@@ -341,18 +340,21 @@ type IdentityStore interface {
 }
 
 // IdentitySettingKey is the vault-setting key holding the identity record
-// for credential key. Value format: "<binding>:<digest>" where binding is
-// CiphertextBinding of the stored value the probe ran with.
+// for credential key. Value format: "<version>:<digest>" where version is
+// the VersionBinding of the stored value the probe ran with, so the digest
+// sits beside the credential version it describes.
 func IdentitySettingKey(credentialKey string) string {
-	return "credential_identity:" + credentialKey
+	return store.CredentialIdentitySettingKey(credentialKey)
 }
 
-// CiphertextBinding is the non-secret handle that ties an identity record
-// to one stored value. Every credential write produces a fresh nonce and
-// ciphertext, so any change to the value invalidates the record.
-func CiphertextBinding(ciphertext []byte) string {
-	sum := sha256.Sum256(ciphertext)
-	return hex.EncodeToString(sum[:16])
+// VersionBinding is the non-secret handle that ties an identity record to
+// one stored value: the credential row's version, which is bound into the
+// value's AAD and bumped on every write (including an OAuth refresh), so
+// any change to the value invalidates the record. Deleting the credential
+// deletes the record too, so a recreated row restarting at version 1
+// cannot inherit it.
+func VersionBinding(version uint64) string {
+	return strconv.FormatUint(version, 10)
 }
 
 // recordedIdentity returns the digest recorded for the single credential

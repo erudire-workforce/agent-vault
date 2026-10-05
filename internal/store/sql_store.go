@@ -530,6 +530,14 @@ func (s *SQLStore) UpdateVaultCredentialStoreHealth(ctx context.Context, vaultID
 // standalone replace and the external-store connect path. Non-static (e.g.
 // oauth) credentials are deliberately left untouched.
 func (s *SQLStore) replaceCredentialsTx(ctx context.Context, tx *sql.Tx, vaultID string, nowStr interface{}, items []EncryptedKV) error {
+	// Rewritten rows restart at version 0, so identity records bound to the
+	// old rows' versions go with them.
+	if _, err := tx.ExecContext(ctx, s.dialect.Rebind(
+		`DELETE FROM vault_settings WHERE vault_id = ? AND key IN
+		   (SELECT 'credential_identity:' || key FROM credentials WHERE vault_id = ? AND type = 'static')`),
+		vaultID, vaultID); err != nil {
+		return fmt.Errorf("clearing credential identities: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, s.dialect.Rebind("DELETE FROM credentials WHERE vault_id = ? AND type = 'static'"), vaultID); err != nil {
 		return fmt.Errorf("clearing credentials: %w", err)
 	}
@@ -960,7 +968,12 @@ func (s *SQLStore) ListCredentials(ctx context.Context, vaultID string) ([]Crede
 }
 
 func (s *SQLStore) DeleteCredential(ctx context.Context, vaultID, key string) error {
-	res, err := s.db.ExecContext(ctx, s.dialect.Rebind("DELETE FROM credentials WHERE vault_id = ? AND key = ?"), vaultID, key)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, s.dialect.Rebind("DELETE FROM credentials WHERE vault_id = ? AND key = ?"), vaultID, key)
 	if err != nil {
 		return fmt.Errorf("deleting credential: %w", err)
 	}
@@ -968,7 +981,13 @@ func (s *SQLStore) DeleteCredential(ctx context.Context, vaultID, key string) er
 	if n == 0 {
 		return sql.ErrNoRows
 	}
-	return nil
+	// A recreated row restarts at version 1; drop the identity record bound
+	// to this row's version so the new value cannot inherit it.
+	if _, err := tx.ExecContext(ctx, s.dialect.Rebind("DELETE FROM vault_settings WHERE vault_id = ? AND key = ?"),
+		vaultID, CredentialIdentitySettingKey(key)); err != nil {
+		return fmt.Errorf("deleting credential identity: %w", err)
+	}
+	return tx.Commit()
 }
 
 // --- OAuth Credentials ---

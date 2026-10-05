@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/Infisical/agent-vault/internal/brokercore"
-	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/store"
 )
 
@@ -59,11 +58,16 @@ func TestIdentityProbeRecordsDigestBoundToStoredValue(t *testing.T) {
 		t.Fatal(err)
 	}
 	setCred := func(val string) {
-		ct, n, err := crypto.Encrypt([]byte(val), key)
+		// Seal for the row's next version, as the credential handlers do.
+		next := uint64(1)
+		if cur, err := st.GetCredential(ctx, v.ID, "NOTION_TOKEN"); err == nil && cur != nil {
+			next = cur.Version + 1
+		}
+		ct, n, err := store.CredentialValueAAD(v.ID, "NOTION_TOKEN", next).Seal([]byte(val), key)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.SetCredential(ctx, v.ID, "NOTION_TOKEN", ct, n); err != nil {
+		if _, err := st.SetCredentialVersion(ctx, v.ID, "NOTION_TOKEN", ct, n, next); err != nil {
 			t.Fatal(err)
 		}
 	}
