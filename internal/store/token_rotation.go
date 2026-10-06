@@ -154,10 +154,13 @@ func (s *SQLStore) MarkTokenRotationWritten(ctx context.Context, rotationID int6
 	return nil
 }
 
-// PublishTokenRotation records a confirmed publish: the new session gets
+// PublishTokenRotation records a confirmed publish of expectedNewSessionID
+// (the session the caller read back from the sink): the new session gets
 // fullExpiry, every other session of the agent is cut to overlapUntil
-// (never extended), and the row moves to published at publishedAt.
-func (s *SQLStore) PublishTokenRotation(ctx context.Context, rotationID int64, fullExpiry, overlapUntil, publishedAt time.Time) error {
+// (never extended), and the row moves to published at publishedAt. It
+// returns ErrRotationState, changing nothing, unless the row is minted and
+// still names expectedNewSessionID.
+func (s *SQLStore) PublishTokenRotation(ctx context.Context, rotationID int64, expectedNewSessionID string, fullExpiry, overlapUntil, publishedAt time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -170,7 +173,7 @@ func (s *SQLStore) PublishTokenRotation(ctx context.Context, rotationID int64, f
 		Scan(&agentID, &state, &newID); err != nil {
 		return fmt.Errorf("reading token rotation: %w", err)
 	}
-	if state != RotationMinted || newID.String == "" {
+	if state != RotationMinted || newID.String == "" || newID.String != expectedNewSessionID {
 		return ErrRotationState
 	}
 	res, err := tx.ExecContext(ctx, s.dialect.Rebind(`UPDATE sessions SET expires_at = ? WHERE id = ? AND agent_id = ?`),
@@ -223,6 +226,22 @@ func (s *SQLStore) FinishTokenRotation(ctx context.Context, rotationID int64) er
 		return ErrRotationState
 	}
 	return nil
+}
+
+// NewestLiveAgentSession returns the stored ID of agentID's most recently
+// created session that has not expired, or "" when it has none.
+func (s *SQLStore) NewestLiveAgentSession(ctx context.Context, agentID string) (string, error) {
+	var id string
+	err := s.db.QueryRowContext(ctx, s.dialect.Rebind(`SELECT id FROM sessions
+		WHERE agent_id = ? AND (expires_at IS NULL OR expires_at > ?)
+		ORDER BY created_at DESC, id DESC LIMIT 1`), agentID, s.dialect.FormatTime(time.Now().UTC())).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading newest agent session: %w", err)
+	}
+	return id, nil
 }
 
 // CapAgentSessionsExcept cuts every session of agentID except keepSessionID

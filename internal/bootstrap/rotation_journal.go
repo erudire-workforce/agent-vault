@@ -35,9 +35,9 @@ import (
 // At most two executor sessions are valid at any time: the delivered old
 // one and one unpublished or newly published replacement.
 
-// PendingExpiry is the new session's expiry until its publish is confirmed,
-// and the cut applied to the old session at mint. Measured on the wall
-// clock, as the proxy checks expiry.
+// PendingExpiry is the new session's expiry until its publish is
+// confirmed. At mint the old session is cut to RotationOverlap, which is
+// shorter. Both are measured on the wall clock, as the proxy checks expiry.
 const PendingExpiry = 15 * time.Minute
 
 // RevokeAfter is the delay between publishing the new token and revoking
@@ -78,10 +78,11 @@ type RotationJournal interface {
 	PlanTokenRotation(ctx context.Context, agentID, oldSessionID string) (*store.TokenRotation, error)
 	MintTokenRotation(ctx context.Context, rotationID int64, pendingUntil, oldUntil time.Time) (string, error)
 	MarkTokenRotationWritten(ctx context.Context, rotationID int64, newSessionID string) error
-	PublishTokenRotation(ctx context.Context, rotationID int64, fullExpiry, overlapUntil, publishedAt time.Time) error
+	PublishTokenRotation(ctx context.Context, rotationID int64, expectedNewSessionID string, fullExpiry, overlapUntil, publishedAt time.Time) error
 	RevokeTokenRotationOld(ctx context.Context, rotationID int64) error
 	FinishTokenRotation(ctx context.Context, rotationID int64) error
 	CapAgentSessionsExcept(ctx context.Context, agentID, keepSessionID string, until time.Time) (int64, error)
+	NewestLiveAgentSession(ctx context.Context, agentID string) (string, error)
 }
 
 // ensureToken keeps a valid, delivered token for agentID. It first resumes
@@ -135,6 +136,14 @@ func ensureToken(ctx context.Context, o Options, agentID string, ttl time.Durati
 		}
 	} else if err != nil {
 		o.log().Warn("bootstrap: delivered token unreadable; rotating", slog.String("agent", o.Executor), slog.String("error", err.Error()))
+		// The sink cannot say which token the executor holds: treat the
+		// agent's newest live session as the old one, so the mint still
+		// expires every other session and at most two stay valid.
+		newest, nerr := j.NewestLiveAgentSession(ctx, agentID)
+		if nerr != nil {
+			return false, fmt.Errorf("bootstrap: %w", nerr)
+		}
+		oldID = newest
 	}
 
 	row, err := j.PlanTokenRotation(ctx, agentID, oldID)
@@ -202,7 +211,7 @@ func mintAndPublish(ctx context.Context, o Options, j RotationJournal, row *stor
 		switch {
 		case err == nil && tok != "" && store.SessionID(tok) == row.NewSessionID:
 			// An earlier attempt's write landed: publish it as is.
-			return true, publish(ctx, o, j, row, exp, ttl)
+			return true, publish(ctx, o, j, row, store.SessionID(tok), exp, ttl)
 		case err != nil && row.WrittenAt != nil && time.Now().Before(row.WrittenAt.Add(PendingExpiry)):
 			// Written, but the read-back is not possible yet; replacing
 			// the token now would only churn the one the executor reads.
@@ -245,18 +254,20 @@ func mintAndPublish(ctx context.Context, o Options, j RotationJournal, row *stor
 	if store.SessionID(got) != row.NewSessionID {
 		return false, errors.New("bootstrap: the token read back from the sink is not the one just written")
 	}
-	return true, publish(ctx, o, j, row, gotExp, ttl)
+	return true, publish(ctx, o, j, row, store.SessionID(got), gotExp, ttl)
 }
 
 // publish extends the confirmed new session to the expiry the sink holds
 // (never past now+ttl), cuts the others to the overlap and records it.
-func publish(ctx context.Context, o Options, j RotationJournal, row *store.TokenRotation, sinkExp time.Time, ttl time.Duration) error {
+// confirmedID is the stored ID of the token read back from the sink; the
+// store refuses the publish unless the row still names that session.
+func publish(ctx context.Context, o Options, j RotationJournal, row *store.TokenRotation, confirmedID string, sinkExp time.Time, ttl time.Duration) error {
 	full := o.now().Add(ttl).UTC().Truncate(time.Second)
 	if !sinkExp.IsZero() && sinkExp.Before(full) {
 		full = sinkExp.UTC()
 	}
 	at := o.now()
-	if err := j.PublishTokenRotation(ctx, row.ID, full, time.Now().Add(RotationOverlap), at); err != nil {
+	if err := j.PublishTokenRotation(ctx, row.ID, confirmedID, full, time.Now().Add(RotationOverlap), at); err != nil {
 		return fmt.Errorf("bootstrap: recording the publish: %w", err)
 	}
 	row.State, row.PublishedAt = store.RotationPublished, &at

@@ -15,9 +15,13 @@
 //     service passes servicepolicy.CheckServicesStrict (provider template,
 //     fixed auth type, explicit read-only method+path allowlist, no
 //     substitutions).
-//   - A new token reaches the sink before any older token is shortened;
-//     older tokens then keep working for RotationOverlap. A token that
-//     could not be delivered is deleted, so the next run re-mints.
+//   - Rotation is journaled (token_rotations, see rotation_journal.go) and
+//     resumed from its state by every run. A new session is pending
+//     (PendingExpiry) until the sink is written and read back with a
+//     matching digest; at mint the old session is cut to RotationOverlap
+//     and it is revoked RevokeAfter after the publish. An unconfirmed
+//     session is expired and replaced, never deleted, and at most two
+//     executor sessions are valid at a time.
 //   - All of it runs under one cross-process lock (Postgres advisory lock
 //     through store.LockVault), so concurrent bootstraps mint once.
 //   - The token is never logged.
@@ -114,8 +118,10 @@ type CertSink interface {
 	PutCACert(ctx context.Context, certPEM []byte) error
 }
 
-// TokenCapper shortens an agent's other tokens after a rotation. The SQL
-// store implements it; without it older tokens keep their own expiry.
+// TokenCapper shortens an agent's other tokens. Bootstrap no longer calls
+// it (the rotation journal caps by stored session ID); it is kept only
+// because TestFinalFix_AmbiguousSinkFailureKeepsDeliveredTokenValid uses it
+// in its counter self-check. Remove it together with that use.
 type TokenCapper interface {
 	CapAgentTokenExpiry(ctx context.Context, agentID, keepRawToken string, until time.Time) (int64, error)
 }
