@@ -17,6 +17,8 @@ The implementer removes the tag from a file in the change that makes its tests p
 | `cmd` `TestAADKMS_RestartRefusesKeyNotEnabled` | a restart unwraps the DEK although the key is no longer Enabled |
 | `cmd` `TestAADKMS_DescribeKeyFailureRefusesStartup` | startup proceeds although DescribeKey fails (`AccessDeniedException`) |
 | `cmd` `TestAADKMS_FakeDescribeKeyReportsState` | passes: this is the known-positive check, showing the fake reports each state and fails on request |
+| `cmd` `TestAADKMS_SetupAndRestartUseOnlyGenerateDataKeyDecryptDescribeKey` | first boot calls `kms:Encrypt` (`kmswrap/aws.go` Wrap). Under a key policy granting only GenerateDataKey, Decrypt and DescribeKey, that call is denied and setup fails. Required: the DEK comes from GenerateDataKey, its CiphertextBlob is stored and opened with Decrypt, and both calls carry exactly `{"service":"agent-vault","environment":<env>}` |
+| `cmd` `TestAADKMS_PolicyFakeRecordsAndDeniesEncrypt` | passes: this is the known-positive check, showing the policy fake denies and records an Encrypt call |
 
 **Superseded test.** `TestEncryptSecrets_RoundTrip` (formerly `internal/infisical/sync_test.go:259`)
 decrypted with nil AAD. It is replaced by the stricter `TestEncryptSecrets_RoundTripWithRowAAD`.
