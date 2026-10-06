@@ -1,5 +1,5 @@
 // Package kmswrap wraps the master DEK with an AWS KMS key. It implements
-// auth.KeyWrapper on top of the KMS Encrypt and Decrypt operations.
+// auth.KeyWrapper with KMS GenerateDataKey, Decrypt and DescribeKey (never Encrypt).
 //
 // The client is built from the standard AWS configuration chain (env, shared
 // config, web identity, container or instance role) and honours the
@@ -115,23 +115,36 @@ func (a *AWS) CheckKeyEnabled(ctx context.Context) error {
 	return nil
 }
 
-// Wrap encrypts dek under the configured key with encCtx and returns the
-// ciphertext blob and the ARN of the key that KMS used.
-func (a *AWS) Wrap(ctx context.Context, dek []byte, encCtx map[string]string) ([]byte, string, error) {
+// GenerateDataKey asks KMS for a fresh 256-bit DEK under the configured key
+// and encCtx. It returns the plaintext DEK (for use in memory only), the
+// CiphertextBlob to store, and the ARN of the key KMS used. This is the only
+// way the DEK is wrapped: the key policy needs kms:GenerateDataKey,
+// kms:Decrypt and kms:DescribeKey, never kms:Encrypt.
+func (a *AWS) GenerateDataKey(ctx context.Context, encCtx map[string]string) ([]byte, []byte, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
-	out, err := a.client.Encrypt(ctx, &kms.EncryptInput{
+	out, err := a.client.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
 		KeyId:             aws.String(a.keyID),
-		Plaintext:         dek,
+		KeySpec:           types.DataKeySpecAes256,
 		EncryptionContext: encCtx,
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("kms: encrypt: %w", err)
+		return nil, nil, "", fmt.Errorf("kms: generate data key: %w", err)
 	}
-	if len(out.CiphertextBlob) == 0 || aws.ToString(out.KeyId) == "" {
-		return nil, "", errors.New("kms: encrypt returned an empty result")
+	if len(out.Plaintext) == 0 || len(out.CiphertextBlob) == 0 || aws.ToString(out.KeyId) == "" {
+		for i := range out.Plaintext {
+			out.Plaintext[i] = 0
+		}
+		return nil, nil, "", errors.New("kms: generate data key returned an empty result")
 	}
-	return out.CiphertextBlob, aws.ToString(out.KeyId), nil
+	return out.Plaintext, out.CiphertextBlob, aws.ToString(out.KeyId), nil
+}
+
+// Wrap is never used with AWS KMS: wrapping a caller-made DEK would need
+// kms:Encrypt, which the key policy does not grant. auth.SetupWithKMS takes
+// the DEK from GenerateDataKey instead. Wrap refuses without calling KMS.
+func (a *AWS) Wrap(context.Context, []byte, map[string]string) ([]byte, string, error) {
+	return nil, "", errors.New("kms: wrapping a caller-supplied DEK is not supported; the DEK comes from GenerateDataKey")
 }
 
 // Unwrap decrypts wrapped with the configured key and encCtx. KMS refuses a

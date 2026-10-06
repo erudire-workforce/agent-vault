@@ -65,6 +65,14 @@ type KeyWrapper interface {
 	Unwrap(ctx context.Context, wrapped []byte, keyID string, encCtx map[string]string) ([]byte, error)
 }
 
+// DataKeyGenerator is a KeyWrapper that can mint the DEK itself (AWS KMS
+// GenerateDataKey): it returns the plaintext DEK, used in memory only, and
+// the wrapped copy to store. SetupWithKMS uses it when the wrapper offers
+// it, so the key policy never needs kms:Encrypt.
+type DataKeyGenerator interface {
+	GenerateDataKey(ctx context.Context, encCtx map[string]string) (dek, wrapped []byte, keyID string, err error)
+}
+
 // ErrNotKMSRecord is returned by UnlockWithKMS for a record that is not
 // KMS-wrapped (passwordless or password-wrapped). There is no fallback.
 var ErrNotKMSRecord = errors.New("master key record is not KMS-wrapped")
@@ -76,14 +84,33 @@ func SetupWithKMS(ctx context.Context, w KeyWrapper, encCtx map[string]string) (
 	if w == nil {
 		return nil, nil, errors.New("KMS key wrapper not configured")
 	}
-	dek, sentinelCT, sentinelNonce, err := generateDEK()
-	if err != nil {
-		return nil, nil, err
-	}
-	wrapped, keyID, err := w.Wrap(ctx, dek, encCtx)
-	if err != nil {
-		crypto.WipeBytes(dek)
-		return nil, nil, fmt.Errorf("wrapping DEK with KMS: %w", err)
+	var (
+		dek, sentinelCT, sentinelNonce, wrapped []byte
+		keyID                                   string
+		err                                     error
+	)
+	if g, ok := w.(DataKeyGenerator); ok {
+		// The DEK comes from KMS; only its wrapped copy is stored.
+		dek, wrapped, keyID, err = g.GenerateDataKey(ctx, encCtx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("generating DEK with KMS: %w", err)
+		}
+		if len(dek) != 32 {
+			crypto.WipeBytes(dek)
+			return nil, nil, fmt.Errorf("generating DEK with KMS: got %d bytes, want 32", len(dek))
+		}
+		if sentinelCT, sentinelNonce, err = sentinelAAD.Seal([]byte(sentinel), dek); err != nil {
+			crypto.WipeBytes(dek)
+			return nil, nil, fmt.Errorf("encrypting sentinel: %w", err)
+		}
+	} else {
+		if dek, sentinelCT, sentinelNonce, err = generateDEK(); err != nil {
+			return nil, nil, err
+		}
+		if wrapped, keyID, err = w.Wrap(ctx, dek, encCtx); err != nil {
+			crypto.WipeBytes(dek)
+			return nil, nil, fmt.Errorf("wrapping DEK with KMS: %w", err)
+		}
 	}
 	if len(wrapped) == 0 || keyID == "" {
 		crypto.WipeBytes(dek)
