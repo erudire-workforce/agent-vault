@@ -256,23 +256,9 @@ func TestSyncerDueAt(t *testing.T) {
 	}
 }
 
-func TestEncryptSecrets_RoundTrip(t *testing.T) {
-	dek := makeDEK(t)
-	items, err := EncryptSecrets([]Secret{{Key: "FOO", Value: "bar"}}, dek)
-	if err != nil {
-		t.Fatalf("EncryptSecrets: %v", err)
-	}
-	if len(items) != 1 {
-		t.Fatalf("expected 1, got %d", len(items))
-	}
-	pt, err := crypto.Decrypt(items[0].Ciphertext, items[0].Nonce, dek)
-	if err != nil {
-		t.Fatalf("Decrypt: %v", err)
-	}
-	if string(pt) != "bar" {
-		t.Fatalf("expected bar, got %q", pt)
-	}
-}
+// TestEncryptSecrets_RoundTrip was superseded by the stricter
+// TestEncryptSecrets_RoundTripWithRowAAD in aadkms_sync_test.go, which
+// requires the row-bound AAD and refuses the nil-AAD open this test pinned.
 
 func TestEncryptSecrets_RejectsEmptyKey(t *testing.T) {
 	if _, err := EncryptSecrets([]Secret{{Key: "", Value: "x"}}, makeDEK(t)); err == nil {
