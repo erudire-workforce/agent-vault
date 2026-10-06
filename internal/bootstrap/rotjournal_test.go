@@ -1,7 +1,6 @@
 // Fork change 17 (journaled executor-token rotation, ADR 0010 part 8 and
-// fork change 9). These tests compile against the current API and fail at
-// runtime until the journal exists. The crash-point cases, which need a
-// fault-injection hook, are in ./journalcontract.
+// fork change 9). The crash-point cases, which use the FaultHook
+// fault-injection API, run on Postgres and SQLite in ./journalcontract.
 //
 // Contract pinned here:
 //   - table token_rotations(agent_id, state, new_session_id, ...) with states

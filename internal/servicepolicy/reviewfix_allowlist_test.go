@@ -1,5 +1,5 @@
 // Blocker 3: the compiled-in Notion allowlist is exactly three method+path
-// pairs. Run with: go test -tags reviewfix ./internal/servicepolicy/
+// pairs.
 //
 // This supersedes TestCheckServiceAllowlist's "ok" list, which still
 // accepts /v1/pages/*, POST /v1/search and POST .../query; the implementer

@@ -1,8 +1,8 @@
-// Package identity does not exist at v0.40.0. It computes the canonical
+// Package identity computes the canonical
 // credential identity digest that the fork publishes in
 // X-Agent-Vault-Credential-Identity and that a relying service recomputes.
 //
-// Intended API:
+// API:
 //
 //	// NotionDigest parses a Notion GET /v1/users/me response and returns
 //	// lowercase hex of sha256("notion" 0x00 bot.workspace_id 0x00 bot.workspace_name 0x00 name).

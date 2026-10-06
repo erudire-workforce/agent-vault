@@ -1,6 +1,5 @@
-// Review-fix tests for blocker 5 (OAuth compare-and-set). They use the
-// OAuthTokenUpdate API specified below, so they stay behind the reviewfix
-// tag until it exists. Run with: go test -tags reviewfix ./internal/store/
+// Review-fix tests for blocker 5 (OAuth compare-and-set), using the
+// OAuthTokenUpdate API specified below.
 // See internal/crypto/REVIEW_FIX_TESTS.md.
 package store
 

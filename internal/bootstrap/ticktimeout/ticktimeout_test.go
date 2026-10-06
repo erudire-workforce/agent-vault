@@ -1,11 +1,8 @@
 // Non-blocking review item: each rotation-loop tick runs under its own
 // timeout, so a hung token sink cannot hold the bootstrap lock forever.
 //
-// Intended API (new): bootstrap.RotationTickTimeout, a package variable
-// (time.Duration) bounding one tick. This directory holds only this test so
-// the expected pre-fix compile failure ("undefined:
-// bootstrap.RotationTickTimeout") does not stop the other bootstrap tests.
-// Run with: go test -tags reviewfix ./internal/bootstrap/ticktimeout/
+// API: bootstrap.RotationTickTimeout, a package variable (time.Duration)
+// bounding one tick.
 package ticktimeout_test
 
 import (

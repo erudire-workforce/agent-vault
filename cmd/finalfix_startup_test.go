@@ -1,4 +1,4 @@
-// Final-review item 4. Run with: go test -tags finalfix ./cmd/
+// Final-review item 4.
 package cmd
 
 import (

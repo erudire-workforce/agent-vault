@@ -1,4 +1,4 @@
-// Review-fix startup tests. Run with: go test -tags reviewfix ./cmd/
+// Review-fix startup tests.
 //
 // The startup checks are expected in attachServerExtensions (cmd/server.go),
 // which both the foreground and detached paths call before serving.

@@ -1,9 +1,7 @@
-// Package aadmigrate does not exist at v0.40.0. These tests pin the one-time
-// migration of legacy (nil-AAD) ciphertexts to row-bound AAD on the SQLite
-// store. Until the package is written they fail to compile with
-// "undefined: Run" / "undefined: IsComplete", confined to this directory.
+// These tests pin the one-time migration of legacy (nil-AAD) ciphertexts
+// to row-bound AAD.
 //
-// Intended API (see internal/crypto/FAILURE_MODES_KMS_AAD.md, "Contract"):
+// API (see internal/crypto/FAILURE_MODES_KMS_AAD.md, "Contract"):
 //
 //	type Result struct{ Rewrapped, AlreadyBound int }
 //	func Run(ctx context.Context, db store.Store, dek []byte) (Result, error)

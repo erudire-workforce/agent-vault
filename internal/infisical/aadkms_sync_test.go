@@ -1,6 +1,6 @@
 // EncryptSecrets seals every synced value with row-bound AAD:
 // store.CredentialValueAAD(vaultID, key, 0), where version 0 matches what
-// replaceCredentialsTx inserts. Run with: go test -tags aadkms ./internal/infisical/
+// replaceCredentialsTx inserts.
 //
 // TestEncryptSecrets_RoundTripWithRowAAD SUPERSEDES TestEncryptSecrets_RoundTrip
 // (formerly sync_test.go:259), which decrypted with nil AAD and so pinned the

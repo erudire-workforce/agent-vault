@@ -1,6 +1,5 @@
 // Startup must refuse when the configured KMS key is not Enabled
 // (Disabled, PendingDeletion, PendingImport) and when DescribeKey fails.
-// Run with: go test -tags aadkms ./cmd/
 //
 // The KMS is the existing in-memory fake (fakeAWSKMS, reached through
 // AWS_ENDPOINT_URL_KMS). A wrapper in front of it answers DescribeKey with

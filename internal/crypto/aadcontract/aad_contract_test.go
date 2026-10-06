@@ -1,11 +1,7 @@
-// Package aadcontract_test pins the API and the byte format that the
-// row-bound AAD patch must provide in internal/crypto. It lives in its own
-// directory so that, before the patch exists, the expected compile failure
-// ("undefined: crypto.EncryptAAD" ...) is confined to this package and does
-// not stop the existing internal/crypto tests from running under
-// `go test -tags kmsaad ./...`.
+// Package aadcontract_test pins the API and the byte format of the
+// row-bound AAD in internal/crypto.
 //
-// Intended API (see internal/crypto/FAILURE_MODES_KMS_AAD.md, section "Contract"):
+// API (see internal/crypto/FAILURE_MODES_KMS_AAD.md, section "Contract"):
 //
 //	type AAD struct {
 //	    Table   string // "credentials", "credential_oauth", "proposal_credentials", "ca_root_key"

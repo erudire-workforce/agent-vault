@@ -1,9 +1,4 @@
-// Blocker 3 at the bootstrap write path. Run with:
-// go test -tags reviewfix ./internal/bootstrap/
-//
-// Note: docJSON in bootstrap_kmsaad_test.go uses /v1/pages/* which the
-// exact allowlist refuses; the implementer moves that fixture to
-// /v1/pages/{id} in the same change.
+// Blocker 3 at the bootstrap write path.
 package bootstrap
 
 import (

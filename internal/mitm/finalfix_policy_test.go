@@ -1,5 +1,5 @@
 // Final-review blockers 1 and 2, through the real proxy listener in
-// service-policy mode. Run with: go test -tags finalfix ./internal/mitm/
+// service-policy mode.
 //
 // The proxy's upstream dialler is redirected to local test servers, so the
 // requests name the real provider host while nothing leaves the machine.

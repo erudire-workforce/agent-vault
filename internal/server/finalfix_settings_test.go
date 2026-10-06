@@ -1,5 +1,4 @@
-// Final-review blocker 2 at the settings API. Run with:
-// go test -tags finalfix ./internal/server/
+// Final-review blocker 2 at the settings API.
 package server
 
 import (

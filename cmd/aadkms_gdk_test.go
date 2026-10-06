@@ -1,8 +1,7 @@
 // The DEK comes from kms:GenerateDataKey (plaintext used in memory,
 // CiphertextBlob stored); kms:Encrypt is never called. The deployment's key
 // policy grants only kms:Decrypt, kms:GenerateDataKey and kms:DescribeKey, so
-// an Encrypt call is denied on first boot. Run with:
-// go test -tags aadkms ./cmd/
+// an Encrypt call is denied on first boot.
 package cmd
 
 import (

@@ -1,6 +1,4 @@
-// Review-fix proxy tests. Run with: go test -tags reviewfix ./internal/mitm/
-// Remove the build tag in the change that makes the WebSocket policy-mode
-// refusal and the documentation paragraph pass.
+// Review-fix proxy tests.
 package mitm
 
 import (

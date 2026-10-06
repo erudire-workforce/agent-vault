@@ -1,9 +1,7 @@
-// Package kmscontract_test pins the KMS key-wrapping API the patch must add
-// to internal/auth and internal/store. It is a separate directory so the
-// expected pre-patch compile failure ("undefined: auth.SetupWithKMS" ...) does
-// not stop the existing internal/auth tests from running under -tags kmsaad.
+// Package kmscontract_test pins the KMS key-wrapping API in internal/auth
+// and internal/store.
 //
-// Intended API (see internal/crypto/FAILURE_MODES_KMS_AAD.md, "Contract"):
+// API (see internal/crypto/FAILURE_MODES_KMS_AAD.md, "Contract"):
 //
 //	type KeyWrapper interface {
 //	    Wrap(ctx context.Context, dek []byte, encCtx map[string]string) (wrapped []byte, keyID string, err error)
