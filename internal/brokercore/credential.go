@@ -222,6 +222,16 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 		slog.Int("decl_order", score.DeclOrder),
 	)
 
+	// A key whose replaced value outlived the rotation grace window without
+	// the provider rejecting it is suspended (database state, so a restart
+	// does not lift it). The identity probe itself is exempt: it is how the
+	// current value's identity gets recorded.
+	if probe == nil {
+		if err := p.checkRotations(ctx, vaultID, matched); err != nil {
+			return nil, err
+		}
+	}
+
 	// Memoize per-key lookups so a credential shared by auth and a
 	// substitution decrypts only once.
 	cache := make(map[string]string)
@@ -322,9 +332,14 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 		return result, fmt.Errorf("%w: %v", ErrCredentialMissing, err)
 	}
 
+	result.CredentialIdentity = p.recordedIdentity(ctx, vaultID, matched.Auth.CredentialKeys(), storedVersion)
+	if probe == nil {
+		if err := p.checkPin(ctx, vaultID, matched.Auth.CredentialKeys(), result.CredentialIdentity); err != nil {
+			return result, err // result carries no headers
+		}
+	}
 	result.Headers = headers
 	result.Substitutions = resolvedSubs
-	result.CredentialIdentity = p.recordedIdentity(ctx, vaultID, matched.Auth.CredentialKeys(), storedVersion)
 	if probe != nil {
 		if keys := matched.Auth.CredentialKeys(); len(keys) == 1 {
 			if row, ok := storedVersion[keys[0]]; ok && row.id != "" {
@@ -440,6 +455,59 @@ func (p *StoreCredentialProvider) recordedIdentity(ctx context.Context, vaultID 
 		return ""
 	}
 	return r.Digest
+}
+
+// CredentialRotationGrace is how long a replaced provider key may stay
+// accepted by the provider before the credential is suspended.
+const CredentialRotationGrace = 24 * time.Hour
+
+// CredentialRotationState is the optional store surface for provider-key
+// rotations. Without it no key is ever suspended.
+type CredentialRotationState interface {
+	CredentialRotationSuspended(ctx context.Context, vaultID, key string, openedBefore time.Time) (bool, error)
+}
+
+// checkRotations refuses when any key the matched service uses has a
+// rotation open longer than CredentialRotationGrace. A failed lookup
+// refuses too.
+func (p *StoreCredentialProvider) checkRotations(ctx context.Context, vaultID string, matched *broker.Service) error {
+	rs, ok := p.Store.(CredentialRotationState)
+	if !ok {
+		return nil
+	}
+	keys := matched.Auth.CredentialKeys()
+	for _, sub := range matched.Substitutions {
+		keys = append(keys, sub.Key)
+	}
+	cutoff := time.Now().Add(-CredentialRotationGrace)
+	for _, k := range keys {
+		suspended, err := rs.CredentialRotationSuspended(ctx, vaultID, k, cutoff)
+		if err != nil || suspended {
+			return ErrRotationUnverified
+		}
+	}
+	return nil
+}
+
+// checkPin enforces the identity pin: when the single injected key has one
+// (vault setting store.CredentialIdentityPinSettingKey), the recorded
+// identity of the exact stored value must equal it. A missing record, a
+// different digest, or a pin that cannot be read all refuse.
+func (p *StoreCredentialProvider) checkPin(ctx context.Context, vaultID string, authKeys []string, recorded string) error {
+	is, ok := p.Store.(IdentityStore)
+	if !ok {
+		return nil
+	}
+	for _, k := range authKeys {
+		pin, err := is.GetVaultSetting(ctx, vaultID, store.CredentialIdentityPinSettingKey(k))
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && pin == "") {
+			continue
+		}
+		if err != nil || len(authKeys) != 1 || recorded == "" || recorded != pin {
+			return ErrIdentityMismatch
+		}
+	}
+	return nil
 }
 
 const oauthRefreshBuffer = 5 * time.Minute

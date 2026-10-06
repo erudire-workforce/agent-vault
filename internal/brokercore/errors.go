@@ -65,4 +65,14 @@ var (
 	// ErrOAuthRefreshFailed means the credential's access token expired
 	// and the automatic refresh attempt failed.
 	ErrOAuthRefreshFailed = errors.New("brokercore: oauth token refresh failed")
+
+	// ErrIdentityMismatch means the credential key has a pinned identity
+	// and the stored value's recorded identity is not it (or is not
+	// recorded). No credential is attached.
+	ErrIdentityMismatch = errors.New("brokercore: credential identity does not match its pin")
+
+	// ErrRotationUnverified means a replaced value of the credential has
+	// outlived the rotation grace window without the provider rejecting it,
+	// so the credential is suspended until it does.
+	ErrRotationUnverified = errors.New("brokercore: superseded credential not yet proven revoked")
 )

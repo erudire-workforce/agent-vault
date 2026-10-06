@@ -227,6 +227,12 @@ func WriteInjectError(w http.ResponseWriter, err error, targetHost, vaultName, b
 	case errors.Is(err, ErrOAuthRefreshFailed):
 		writeProxyErrorWithHelp(w, http.StatusBadGateway, "oauth_refresh_failed",
 			"OAuth token expired and refresh failed — reconnect in the Agent Vault dashboard", baseURL)
+	case errors.Is(err, ErrIdentityMismatch):
+		WriteProxyError(w, http.StatusForbidden, "IDENTITY_MISMATCH",
+			"The stored credential's identity does not match the identity pinned for it; paste the key for the pinned account")
+	case errors.Is(err, ErrRotationUnverified):
+		WriteProxyError(w, http.StatusForbidden, "CREDENTIAL_ROTATION_UNVERIFIED",
+			"The credential was replaced more than 24 hours ago and the provider still accepts the old key; revoke the old key at the provider")
 	case errors.Is(err, ErrCredentialMissing):
 		writeProxyErrorWithHelp(w, http.StatusBadGateway, "credential_not_found",
 			"A required credential could not be resolved; check vault configuration", baseURL)
