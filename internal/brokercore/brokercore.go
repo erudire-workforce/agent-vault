@@ -91,9 +91,14 @@ func IsBrokerScopedRequestHeader(name string) bool {
 // any header named in the client's Connection field is also hop-by-hop
 // for that connection and is stripped.
 func ApplyInjection(src, dst http.Header, inject *InjectResult, extraStrip ...string) {
-	strip := make(map[string]bool, len(extraStrip)+len(inject.Headers))
+	strip := make(map[string]bool, len(extraStrip)+len(inject.Headers)+len(methodOverrideHeaders))
 	for _, s := range extraStrip {
 		strip[http.CanonicalHeaderKey(s)] = true
+	}
+	if inject.MethodsRestricted {
+		for _, h := range methodOverrideHeaders {
+			strip[http.CanonicalHeaderKey(h)] = true
+		}
 	}
 	for k := range inject.Headers {
 		strip[http.CanonicalHeaderKey(k)] = true
@@ -118,6 +123,12 @@ func ApplyInjection(src, dst http.Header, inject *InjectResult, extraStrip ...st
 		dst.Set(k, v)
 	}
 }
+
+// methodOverrideHeaders are the conventional headers through which a
+// client asks an upstream to treat a request as another method. They are
+// stripped for services that restrict methods (see
+// InjectResult.MethodsRestricted).
+var methodOverrideHeaders = []string{"X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override"}
 
 // helpLinks returns the standard "see available services / usage instructions"
 // suffix appended to broker-layer error messages when baseURL is known.

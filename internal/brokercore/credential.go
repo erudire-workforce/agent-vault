@@ -60,6 +60,11 @@ type InjectResult struct {
 	// policy permitted forwarding.
 	Passthrough bool
 
+	// MethodsRestricted is set when the matched service lists its allowed
+	// methods. ApplyInjection then strips method-override headers, so an
+	// upstream that honours them cannot turn an allowed method into another.
+	MethodsRestricted bool
+
 	// CredentialIdentity is the recorded identity digest (see package
 	// identity) of the account the injected credential acts as, or ""
 	// when none is recorded for the exact stored value that was
@@ -279,6 +284,8 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 		MatchedPath:    matched.Path,
 		MatchedPort:    matched.Port,
 		CredentialKeys: matched.CredentialKeys(),
+		// nil Methods allows every method; any explicit list restricts.
+		MethodsRestricted: matched.Methods != nil,
 	}
 
 	// Resolve substitutions before auth so passthrough services (which

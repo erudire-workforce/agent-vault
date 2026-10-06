@@ -108,8 +108,9 @@ func forms(s string) []string {
 	}
 	// JSON string escaping, with and without HTML escaping (Go's encoder
 	// writes > for '>' by default).
+	var jsonForms []string
 	if j, err := json.Marshal(s); err == nil && len(j) >= 2 {
-		out = append(out, string(j[1:len(j)-1]))
+		jsonForms = append(jsonForms, string(j[1:len(j)-1]))
 	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -117,7 +118,15 @@ func forms(s string) []string {
 	if enc.Encode(s) == nil {
 		j := bytes.TrimRight(buf.Bytes(), "\n")
 		if len(j) >= 2 {
-			out = append(out, string(j[1:len(j)-1]))
+			jsonForms = append(jsonForms, string(j[1:len(j)-1]))
+		}
+	}
+	out = append(out, jsonForms...)
+	// Some JSON encoders (PHP's default, several Java ones) also escape '/'
+	// as "\/"; add that variant of every JSON form.
+	for _, f := range jsonForms {
+		if strings.Contains(f, "/") {
+			out = append(out, strings.ReplaceAll(f, "/", `\/`))
 		}
 	}
 	return out
