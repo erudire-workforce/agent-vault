@@ -53,6 +53,11 @@ func unlockOrSetupKMS(db store.Store) (mk *auth.MasterKey, handled bool, err err
 	if err != nil {
 		return nil, true, err
 	}
+	// First setup and restart alike: the key must be Enabled, checked
+	// explicitly before it wraps or unwraps anything.
+	if err := w.CheckKeyEnabled(ctx); err != nil {
+		return nil, true, err
+	}
 
 	if record == nil {
 		mk, rec, err := auth.SetupWithKMS(ctx, w, settings.Ctx)

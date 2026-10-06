@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/broker"
-	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/store"
 )
 
@@ -175,7 +174,7 @@ func (s *Syncer) refresh(ctx context.Context, cs store.VaultCredentialStore) err
 		return err
 	}
 
-	items, err := EncryptSecrets(secs, s.dek)
+	items, err := EncryptSecrets(cs.VaultID, secs, s.dek)
 	if err != nil {
 		s.recordFailure(ctx, cs.VaultID, err)
 		return err
@@ -213,8 +212,14 @@ func (s *Syncer) refresh(ctx context.Context, cs store.VaultCredentialStore) err
 var ErrInvalidKey = errors.New("infisical: upstream secret key does not match required pattern")
 
 // EncryptSecrets encrypts plaintext Infisical secrets for
-// store.ReplaceVaultCredentials. Reused by the vault-create handler.
-func EncryptSecrets(secs []Secret, dek []byte) ([]store.EncryptedKV, error) {
+// store.ReplaceVaultCredentials. Each value is sealed with row-bound AAD,
+// store.CredentialValueAAD(vaultID, key, 0): version 0 is the version
+// replaceCredentialsTx inserts, so the proxy opens it at the row's version
+// and a value moved to another vault, key, version or table does not open.
+func EncryptSecrets(vaultID string, secs []Secret, dek []byte) ([]store.EncryptedKV, error) {
+	if vaultID == "" {
+		return nil, errors.New("infisical: encrypting secrets without a vault id")
+	}
 	out := make([]store.EncryptedKV, 0, len(secs))
 	for _, sec := range secs {
 		if sec.Key == "" {
@@ -223,7 +228,7 @@ func EncryptSecrets(secs []Secret, dek []byte) ([]store.EncryptedKV, error) {
 		if !broker.CredentialKeyPattern.MatchString(sec.Key) {
 			return nil, fmt.Errorf("%w: %q (Agent Vault requires UPPER_SNAKE_CASE; rename the secret upstream)", ErrInvalidKey, sec.Key)
 		}
-		ct, nonce, err := crypto.Encrypt([]byte(sec.Value), dek)
+		ct, nonce, err := store.CredentialValueAAD(vaultID, sec.Key, 0).Seal([]byte(sec.Value), dek)
 		if err != nil {
 			return nil, fmt.Errorf("encrypting %q: %w", sec.Key, err)
 		}

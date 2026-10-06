@@ -1,5 +1,3 @@
-//go:build finalfix
-
 // Final-review item 5: no non-test code may seal a value without AAD. The
 // scan parses every non-test Go file in the module and reports
 //   - any call to crypto.Encrypt (the nil-AAD legacy seal), and

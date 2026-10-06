@@ -1,5 +1,3 @@
-//go:build aadkms
-
 // EncryptSecrets seals every synced value with row-bound AAD:
 // store.CredentialValueAAD(vaultID, key, 0), where version 0 matches what
 // replaceCredentialsTx inserts. Run with: go test -tags aadkms ./internal/infisical/

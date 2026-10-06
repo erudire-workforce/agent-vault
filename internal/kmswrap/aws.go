@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
+	"github.com/aws/aws-sdk-go-v2/service/kms/types"
 )
 
 // Environment variables that configure KMS mode.
@@ -93,6 +94,25 @@ func NewAWS(ctx context.Context, keyID string) (*AWS, error) {
 		return nil, fmt.Errorf("kms: loading AWS configuration: %w", err)
 	}
 	return &AWS{client: kms.NewFromConfig(cfg), keyID: keyID}, nil
+}
+
+// CheckKeyEnabled calls DescribeKey and returns an error unless the
+// configured key's state is Enabled. Any DescribeKey failure is an error
+// too: startup never proceeds on a key whose state it could not read.
+func (a *AWS) CheckKeyEnabled(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+	out, err := a.client.DescribeKey(ctx, &kms.DescribeKeyInput{KeyId: aws.String(a.keyID)})
+	if err != nil {
+		return fmt.Errorf("kms: describe key %q: %w", a.keyID, err)
+	}
+	if out.KeyMetadata == nil {
+		return fmt.Errorf("kms: describe key %q returned no metadata", a.keyID)
+	}
+	if state := out.KeyMetadata.KeyState; state != types.KeyStateEnabled {
+		return fmt.Errorf("kms: key %q is in state %s, not Enabled; refusing to use it", a.keyID, state)
+	}
+	return nil
 }
 
 // Wrap encrypts dek under the configured key with encCtx and returns the

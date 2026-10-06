@@ -1,5 +1,3 @@
-//go:build aadkms
-
 // Startup must refuse when the configured KMS key is not Enabled
 // (Disabled, PendingDeletion, PendingImport) and when DescribeKey fails.
 // Run with: go test -tags aadkms ./cmd/

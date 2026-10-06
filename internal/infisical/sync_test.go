@@ -261,7 +261,7 @@ func TestSyncerDueAt(t *testing.T) {
 // requires the row-bound AAD and refuses the nil-AAD open this test pinned.
 
 func TestEncryptSecrets_RejectsEmptyKey(t *testing.T) {
-	if _, err := EncryptSecrets([]Secret{{Key: "", Value: "x"}}, makeDEK(t)); err == nil {
+	if _, err := EncryptSecrets(aadVaultA, []Secret{{Key: "", Value: "x"}}, makeDEK(t)); err == nil {
 		t.Fatalf("expected error for empty key")
 	}
 }
@@ -271,7 +271,7 @@ func TestEncryptSecrets_RejectsEmptyKey(t *testing.T) {
 func TestEncryptSecrets_RejectsNonUpperSnakeKey(t *testing.T) {
 	cases := []string{"database-url", "myApiKey", "api key", "lower_case", "123_KEY"}
 	for _, k := range cases {
-		_, err := EncryptSecrets([]Secret{{Key: k, Value: "x"}}, makeDEK(t))
+		_, err := EncryptSecrets(aadVaultA, []Secret{{Key: k, Value: "x"}}, makeDEK(t))
 		if err == nil {
 			t.Fatalf("key %q must be rejected", k)
 		}
