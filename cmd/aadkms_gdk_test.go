@@ -1,5 +1,3 @@
-//go:build aadkms
-
 // The DEK comes from kms:GenerateDataKey (plaintext used in memory,
 // CiphertextBlob stored); kms:Encrypt is never called. The deployment's key
 // policy grants only kms:Decrypt, kms:GenerateDataKey and kms:DescribeKey, so
