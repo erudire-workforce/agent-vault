@@ -28,10 +28,26 @@ not hide the other bootstrap tests.
 | 3 | `bootstrap` `TestReviewFix_Bootstrap_RefusesOutsideExactAllowlist` | `Apply` writes them |
 | 3 | `cmd` `TestReviewFix_StartupRefusesKMSWithoutPolicyMode` | startup with KMS required and no policy mode returns nil |
 | 3 | `cmd` `TestReviewFix_StartupRefusesBootstrapWithoutPolicyMode` | startup goes on to call Secrets Manager instead of refusing |
-| 4 | `mitm` `TestReviewFix_WebSocketRefusedWhenCredentialInjected` | a 101 is relayed, and the upstream's first frame carries the injected bearer to the client |
-| 4 | `mitm` `TestReviewFix_WebSocketRefusedInPolicyMode` | a 101 is relayed while the policy mode is active |
-| 5 | `store` `TestReviewFix_OAuthTokenRefreshCompareAndSet` | the second refresh sealed for v+1 succeeds, the row moves to v+2, and neither the access nor the refresh token decrypts |
-| 5 | `store` `TestReviewFix_OAuthClientSecretCompareAndSet` | same for `client_secret_version` through `SetCredentialOAuth` |
+| 4 | `mitm` `TestReviewFix_WebSocketRefusedInPolicyMode` (credential injected, passthrough) | with the policy mode active, a 101 is relayed and the upstream is dialled; required is 403 and no upstream contact |
+| 4 | `mitm` `TestReviewFix_WebSocketLimitationDocumented` | no paragraph in README.md, SECURITY.md or docs/ says WebSocket frames are not echo-scrubbed when `AGENT_VAULT_SERVICE_POLICY` is off |
+| 4 | `mitm` `TestReviewFix_WebSocketUnchangedWithoutPolicyMode` | passes (guard): with the mode off, upstream WebSocket credential injection is unchanged |
+| 5 | `store` `TestReviewFix_OAuthTokenRefreshCompareAndSet` | needs the `OAuthTokenUpdate` API specified in `reviewfix_oauth_cas_test.go`; the second refresh sealed for the same next versions must return `ErrVersionConflict` and leave both tokens decrypting |
+| 5 | `store` `TestReviewFix_OAuthClientSecretCompareAndSet` | `SetCredentialOAuth` ignores `ClientSecretVersion`; the second write sealed for the same version must return `ErrVersionConflict` |
+
+**WebSocket decision.** Upgrades are refused only while the service-policy mode is active. With
+the mode off, the fork keeps upstream's WebSocket credential injection, and its frames are not
+echo-scrubbed; the documentation must say so.
+
+**OAuth compare-and-set API.** `UpdateCredentialOAuthTokens(ctx, vaultID, key, OAuthTokenUpdate)`,
+where each ciphertext travels with the version it was sealed for (`AccessVersion`,
+`RefreshVersion`), as `SetCredentialVersion` does. `SetCredentialOAuth` treats
+`co.ClientSecretVersion` (and `co.Version` when a refresh token is set) the same way. Changing
+the interface also changes these test call sites, which the implementer updates in the same
+commit:
+- `internal/aadmigrate/aadmigrate_kmsaad_test.go` `legacyOAuth`, which becomes
+  `OAuthTokenUpdate{AccessVersion: 1, RefreshVersion: 1, ...}`;
+- `internal/brokercore/kmsaad_oauth_swap_test.go` `fakeOAuthStore.UpdateCredentialOAuthTokens`;
+- `internal/server/server_test.go` `mockStore.UpdateCredentialOAuthTokens`.
 
 ## Non-blocking
 

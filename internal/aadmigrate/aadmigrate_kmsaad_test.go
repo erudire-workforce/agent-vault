@@ -90,7 +90,7 @@ func (e *env) legacyOAuth(t *testing.T, key, access, refresh, clientSecret strin
 	csCT, csN := enc(clientSecret)
 	if err := e.db.SetCredentialOAuth(ctx, &store.CredentialOAuth{
 		VaultID: e.vaultID, CredentialKey: key, TokenURL: "https://token.example.test/token",
-		ClientID: "cid", ClientSecretCT: csCT, ClientSecretNonce: csN,
+		ClientID: "cid", ClientSecretCT: csCT, ClientSecretNonce: csN, ClientSecretVersion: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}

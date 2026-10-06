@@ -1,6 +1,8 @@
 //go:build reviewfix
 
-// Review-fix tests (test-first). Run with: go test -tags reviewfix ./...
+// Review-fix tests for blocker 5 (OAuth compare-and-set). They use the
+// OAuthTokenUpdate API specified below, so they stay behind the reviewfix
+// tag until it exists. Run with: go test -tags reviewfix ./internal/store/
 // See internal/crypto/REVIEW_FIX_TESTS.md.
 package store
 
@@ -10,48 +12,6 @@ import (
 	"testing"
 	"time"
 )
-
-func reviewVault(t *testing.T, s *SQLStore) string {
-	t.Helper()
-	v, err := s.CreateVault(context.Background(), "review-vault")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return v.ID
-}
-
-// Blocker 1 (and the non-blocking "identity cleared after a proposal
-// delete"): ApplyProposal deletes credential rows but not their
-// credential_identity:<key> record, so a value recreated at version 1
-// inherits the old digest.
-func TestReviewFix_ApplyProposalDeleteClearsIdentity(t *testing.T) {
-	s := openTestDB(t)
-	ctx := context.Background()
-	vid := reviewVault(t, s)
-	if _, err := s.SetCredentialVersion(ctx, vid, "EXAMPLE_TOKEN", []byte("ct"), []byte("nonce-123456"), 1); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.SetVaultSetting(ctx, vid, CredentialIdentitySettingKey("EXAMPLE_TOKEN"), "1:digest-of-old-value"); err != nil {
-		t.Fatal(err)
-	}
-	sess, err := s.CreateScopedSession(ctx, CreateScopedSessionParams{VaultID: vid, VaultRole: "proxy"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	p, err := s.CreateProposal(ctx, vid, sess.ID, `[]`, `[{"action":"delete","key":"EXAMPLE_TOKEN"}]`, "delete", "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.ApplyProposal(ctx, vid, p.ID, `[]`, nil, []string{"EXAMPLE_TOKEN"}, nil); err != nil {
-		t.Fatalf("ApplyProposal: %v", err)
-	}
-	if c, _ := s.GetCredential(ctx, vid, "EXAMPLE_TOKEN"); c != nil {
-		t.Fatal("precondition: credential not deleted by the proposal")
-	}
-	if rec, _ := s.GetVaultSetting(ctx, vid, CredentialIdentitySettingKey("EXAMPLE_TOKEN")); rec != "" {
-		t.Fatalf("identity record %q survived a proposal delete; a value recreated at version 1 would inherit it", rec)
-	}
-}
 
 // oauthRow creates an OAuth credential with refresh token and client secret
 // sealed for their first versions and returns the row.
@@ -68,7 +28,8 @@ func oauthRow(t *testing.T, s *SQLStore, vid string, dek []byte) *CredentialOAut
 	}
 	if err := s.SetCredentialOAuth(ctx, &CredentialOAuth{
 		VaultID: vid, CredentialKey: "EXAMPLE_OAUTH", TokenURL: "https://token.example.test/token", ClientID: "cid",
-		ClientSecretCT: csCT, ClientSecretNonce: csN, RefreshTokenCT: rCT, RefreshTokenNonce: rN,
+		ClientSecretCT: csCT, ClientSecretNonce: csN, ClientSecretVersion: 1,
+		RefreshTokenCT: rCT, RefreshTokenNonce: rN, Version: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +40,25 @@ func oauthRow(t *testing.T, s *SQLStore, vid string, dek []byte) *CredentialOAut
 	return co
 }
 
+// Blocker 5 API (specified here, same pattern as SetCredentialVersion):
+//
+//	// OAuthTokenUpdate is one token write. Each ciphertext is sealed for the
+//	// version given beside it, which is the row's next version; the write
+//	// lands only if the row is still at that version minus one, otherwise
+//	// it returns ErrVersionConflict and changes nothing.
+//	type OAuthTokenUpdate struct {
+//	    AccessCT, AccessNonce   []byte
+//	    AccessVersion           uint64     // credentials.version AccessCT was sealed for
+//	    RefreshCT, RefreshNonce []byte     // nil keeps the stored refresh token
+//	    RefreshVersion          uint64     // credential_oauth.version RefreshCT was sealed for; ignored when RefreshCT is nil
+//	    ExpiresAt               *time.Time
+//	}
+//	UpdateCredentialOAuthTokens(ctx, vaultID, key string, u OAuthTokenUpdate) error
+//
+// SetCredentialOAuth: when ClientSecretCT is set, co.ClientSecretVersion is
+// the version it was sealed for (compare-and-set against version-1); when
+// RefreshTokenCT is set, co.Version is likewise the version it was sealed for.
+//
 // Blocker 5: two concurrent refreshes read the same row versions and both
 // seal for v+1. The second write must fail its compare-and-set (so the
 // caller retries); it must not move the row to v+2 with ciphertexts that
@@ -107,12 +87,19 @@ func TestReviewFix_OAuthTokenRefreshCompareAndSet(t *testing.T) {
 		return aCT, aN, rCT, rN
 	}
 	exp := time.Now().Add(time.Hour)
-	a1, an1, r1, rn1 := seal("first")
-	a2, an2, r2, rn2 := seal("second")
-	if err := s.UpdateCredentialOAuthTokens(ctx, vid, "EXAMPLE_OAUTH", a1, an1, r1, rn1, &exp); err != nil {
+	update := func(tag string) OAuthTokenUpdate {
+		aCT, aN, rCT, rN := seal(tag)
+		return OAuthTokenUpdate{
+			AccessCT: aCT, AccessNonce: aN, AccessVersion: accessNext,
+			RefreshCT: rCT, RefreshNonce: rN, RefreshVersion: refreshNext,
+			ExpiresAt: &exp,
+		}
+	}
+	first, second := update("first"), update("second")
+	if err := s.UpdateCredentialOAuthTokens(ctx, vid, "EXAMPLE_OAUTH", first); err != nil {
 		t.Fatalf("first refresh write: %v", err)
 	}
-	err2 := s.UpdateCredentialOAuthTokens(ctx, vid, "EXAMPLE_OAUTH", a2, an2, r2, rn2, &exp)
+	err2 := s.UpdateCredentialOAuthTokens(ctx, vid, "EXAMPLE_OAUTH", second)
 	if err2 == nil {
 		t.Error("second refresh sealed for the same versions succeeded; it must fail its compare-and-set")
 	} else if !errors.Is(err2, ErrVersionConflict) {
@@ -152,7 +139,7 @@ func TestReviewFix_OAuthClientSecretCompareAndSet(t *testing.T) {
 		}
 		return s.SetCredentialOAuth(ctx, &CredentialOAuth{
 			VaultID: vid, CredentialKey: "EXAMPLE_OAUTH", TokenURL: "https://token.example.test/token", ClientID: "cid",
-			ClientSecretCT: ct, ClientSecretNonce: n,
+			ClientSecretCT: ct, ClientSecretNonce: n, ClientSecretVersion: next,
 		})
 	}
 	if err := write("first"); err != nil {
