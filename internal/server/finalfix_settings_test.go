@@ -1,5 +1,3 @@
-//go:build finalfix
-
 // Final-review blocker 2 at the settings API. Run with:
 // go test -tags finalfix ./internal/server/
 package server

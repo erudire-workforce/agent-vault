@@ -285,6 +285,11 @@ func Validate(doc *Document, executor string) error {
 			return fmt.Errorf("bootstrap: service %q listed twice in vault %q", sp.Name, sp.Vault)
 		}
 		svcNames[sp.Vault+"/"+sp.Name] = true
+		// In the policy mode every vault denies unmatched hosts, so every
+		// service must say so (strict_deny sets unmatched_host_policy=deny).
+		if servicepolicy.Active() && !sp.StrictDeny {
+			return fmt.Errorf("bootstrap: service %q: %s is active, so strict_deny must be true", sp.Name, servicepolicy.EnvMode)
+		}
 		svc, err := sp.toService()
 		if err != nil {
 			return fmt.Errorf("bootstrap: service %q: %w", sp.Name, err)
@@ -555,6 +560,12 @@ func ensureToken(ctx context.Context, o Options, agentID string, ttl time.Durati
 				exp = *sess.ExpiresAt
 			}
 			if now.Before(exp.Add(-RotateBefore)) {
+				// Nothing to mint, but every run still caps the agent's
+				// other tokens (say one left by a run that crashed after
+				// minting, or by an ambiguous delivery) to the overlap.
+				if err := capOtherTokens(ctx, o, agentID, tok); err != nil {
+					return false, fmt.Errorf("bootstrap: older tokens not shortened: %w", err)
+				}
 				return false, nil
 			}
 		}
@@ -568,20 +579,31 @@ func ensureToken(ctx context.Context, o Options, agentID string, ttl time.Durati
 		return false, fmt.Errorf("bootstrap: minting token: %w", err)
 	}
 	if err := o.Tokens.PutToken(ctx, o.Executor, sess.ID, expiresAt); err != nil {
-		if derr := o.Store.DeleteSession(ctx, sess.ID); derr != nil {
-			o.log().Error("bootstrap: undelivered token could not be deleted", slog.String("agent", o.Executor), slog.String("error", derr.Error()))
-		}
-		return false, fmt.Errorf("bootstrap: delivering token: %w", err)
+		// The error is ambiguous: the write may have landed and its
+		// response been lost, so the new token may be the one the sink now
+		// holds. The delivery is rejected (an error, and no token is
+		// capped), but the new session is kept rather than deleted, so the
+		// executor is never cut off. The next run reads the sink and caps
+		// whichever token is not the delivered one.
+		return false, fmt.Errorf("bootstrap: delivering token (outcome unknown; the minted token is kept and the next run reconciles): %w", err)
 	}
-	if capper, ok := o.Store.(TokenCapper); ok {
-		if _, err := capper.CapAgentTokenExpiry(ctx, agentID, sess.ID, time.Now().Add(RotationOverlap)); err != nil {
-			return true, fmt.Errorf("bootstrap: token delivered but older tokens not shortened: %w", err)
-		}
-	} else {
-		o.log().Warn("bootstrap: store cannot shorten older tokens; they stay valid until their own expiry")
+	if err := capOtherTokens(ctx, o, agentID, sess.ID); err != nil {
+		return true, fmt.Errorf("bootstrap: token delivered but older tokens not shortened: %w", err)
 	}
 	o.log().Info("bootstrap: executor token delivered", slog.String("agent", o.Executor), slog.Time("expires_at", expiresAt))
 	return true, nil
+}
+
+// capOtherTokens shortens every token of agentID except keep (the raw token
+// the sink holds) to now+RotationOverlap. It only ever shortens an expiry.
+func capOtherTokens(ctx context.Context, o Options, agentID, keep string) error {
+	capper, ok := o.Store.(TokenCapper)
+	if !ok {
+		o.log().Warn("bootstrap: store cannot shorten older tokens; they stay valid until their own expiry")
+		return nil
+	}
+	_, err := capper.CapAgentTokenExpiry(ctx, agentID, keep, time.Now().Add(RotationOverlap))
+	return err
 }
 
 // liveSession returns tok's session when the store still accepts it as a

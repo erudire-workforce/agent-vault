@@ -1,5 +1,3 @@
-//go:build finalfix
-
 // Final-review item 4. Run with: go test -tags finalfix ./cmd/
 package cmd
 

@@ -1,5 +1,3 @@
-//go:build finalfix
-
 // Final-review blockers 1 and 2, through the real proxy listener in
 // service-policy mode. Run with: go test -tags finalfix ./internal/mitm/
 //

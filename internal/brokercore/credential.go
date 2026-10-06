@@ -190,6 +190,11 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 		return nil, ErrMethodNotAllowed
 	}
 	if matched == nil {
+		// In the service-policy mode an unmatched request is refused
+		// whatever the vault's unmatched_host_policy says.
+		if servicepolicy.Active() {
+			return nil, ErrServiceNotFound
+		}
 		// Fail closed on policy lookup errors so a transient store
 		// failure can't silently strip enforcement.
 		policy, err := p.Store.UnmatchedHostPolicy(ctx, vaultID)

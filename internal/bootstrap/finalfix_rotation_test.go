@@ -1,5 +1,3 @@
-//go:build finalfix
-
 // Final-review item 3: rotation must not leave old executor tokens running at
 // full TTL. Run with: go test -tags finalfix ./internal/bootstrap/
 package bootstrap

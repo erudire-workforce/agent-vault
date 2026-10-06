@@ -259,6 +259,15 @@ func (p *Proxy) forwardRequest(
 	// service-policy mode every Upgrade is refused before a credential is
 	// resolved or the upstream is contacted. With the mode off the upstream
 	// WebSocket behaviour (credential injection included) is unchanged.
+	// In the service-policy mode a credential only ever travels over TLS to
+	// port 443: cleartext HTTP (whatever the port) and any other port are
+	// refused before a credential is resolved or the upstream is dialled.
+	if servicepolicy.Active() && (!useTLSUpstream || port != 443) {
+		brokercore.WriteProxyError(w, http.StatusForbidden, "policy_requires_tls_443",
+			"Requests are refused unless they use TLS to port 443 while the service policy mode ("+servicepolicy.EnvMode+") is active.")
+		emit(http.StatusForbidden, "policy_requires_tls_443")
+		return
+	}
 	if servicepolicy.Active() && isWebSocketUpgrade(r) {
 		brokercore.WriteProxyError(w, http.StatusForbidden, "websocket_refused",
 			"WebSocket upgrades are refused while the service policy mode ("+servicepolicy.EnvMode+") is active.")

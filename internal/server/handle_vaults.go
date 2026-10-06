@@ -15,6 +15,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/broker"
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/infisical"
+	"github.com/Infisical/agent-vault/internal/servicepolicy"
 	"github.com/Infisical/agent-vault/internal/store"
 )
 
@@ -799,6 +800,13 @@ func (s *Server) handleVaultSettingsPatch(w http.ResponseWriter, r *http.Request
 	// DB on a security-relevant control.
 	if body.UnmatchedHostPolicy != nil {
 		val := strings.TrimSpace(*body.UnmatchedHostPolicy)
+		// In the policy mode unmatched requests are always refused, so a
+		// vault cannot be switched (or reset, which means passthrough) to
+		// anything but deny.
+		if servicepolicy.Active() && val != string(brokercore.PolicyDeny) {
+			jsonError(w, http.StatusForbidden, fmt.Sprintf("Refused by %s: unmatched_host_policy must stay %q", servicepolicy.EnvMode, brokercore.PolicyDeny))
+			return
+		}
 		var effective brokercore.UnmatchedHostPolicy
 		if val == "" {
 			if err := s.store.DeleteVaultSetting(ctx, ns.ID, settingUnmatchedHostPolicy); err != nil {

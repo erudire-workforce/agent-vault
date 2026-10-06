@@ -264,7 +264,7 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort int, maste
 }
 
 // requirePolicyModeForHardenedDeployments refuses to start a deployment
-// that requires KMS or is configured from a bootstrap secret unless the
+// that enables KMS or is configured from a bootstrap secret unless the
 // compiled-in service policy is active. Those are the hardened deployment
 // shapes; serving them with the policy off would let any service be
 // written. It runs before any AWS call.
@@ -279,8 +279,10 @@ func requirePolicyModeForHardenedDeployments() error {
 	if err != nil {
 		return err
 	}
-	if settings.Required {
-		return fmt.Errorf("%s is set but %s is not %q; refusing to start", kmswrap.EnvRequire, servicepolicy.EnvMode, servicepolicy.ModeReadonlyAllowlist)
+	// KMS enabled (a key id configured) is a hardened deployment whether or
+	// not AGENT_VAULT_REQUIRE_KMS is also set.
+	if settings.Required || settings.Enabled() {
+		return fmt.Errorf("KMS is enabled (%s) but %s is not %q; refusing to start", kmswrap.EnvKeyID, servicepolicy.EnvMode, servicepolicy.ModeReadonlyAllowlist)
 	}
 	return nil
 }
