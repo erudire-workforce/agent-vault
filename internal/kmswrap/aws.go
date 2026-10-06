@@ -61,8 +61,15 @@ func SettingsFromEnv() (Settings, error) {
 	if env == "" {
 		return s, fmt.Errorf("%s is set but %s is empty; the wrapped DEK must be bound to a deployment environment", EnvKeyID, EnvContextEnv)
 	}
-	s.Ctx = map[string]string{"app": "agent-vault", "env": env}
+	s.Ctx = EncryptionContext(env)
 	return s, nil
+}
+
+// EncryptionContext is the KMS encryption context bound to the wrapped DEK:
+// exactly {"service":"agent-vault","environment":env}. Every Encrypt,
+// Decrypt and GenerateDataKey call carries it unchanged.
+func EncryptionContext(env string) map[string]string {
+	return map[string]string{"service": "agent-vault", "environment": env}
 }
 
 func truthy(v string) bool {

@@ -347,7 +347,7 @@ func TestKMSAAD_Startup_FreshStore_WrapsDEKWithKMS_AndUnwrapsOnRestart(t *testin
 		}
 		var sawWrap bool
 		for _, c := range f.snapshot() {
-			if (c.Op == "Encrypt" || c.Op == "GenerateDataKey") && c.Ctx["env"] == envNameProd {
+			if (c.Op == "Encrypt" || c.Op == "GenerateDataKey") && c.Ctx["environment"] == envNameProd {
 				sawWrap = true
 			}
 		}
