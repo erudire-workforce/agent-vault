@@ -28,8 +28,9 @@ import (
 //     otherwise the unpublished session is expired and replaced.
 //   - published: the new session has its full TTL (only after the sink was
 //     written AND read back with a matching digest); the old one is revoked
-//     RevokeAfter later. A rotation with no delivered old token (first
-//     boot, or an unreadable sink) closes at once.
+//     RevokeAfter later. A rotation with no old session closes at once:
+//     first boot, or an unreadable sink when the agent has no live session
+//     (otherwise its newest live session is the old one).
 //   - done: closed.
 //
 // At most two executor sessions are valid at any time: the delivered old
