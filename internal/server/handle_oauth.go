@@ -26,6 +26,18 @@ const oauthStateTTL = 10 * time.Minute
 
 const oauthSecretSentinel = "••••••••"
 
+// oauthWriteAttempts bounds the compare-and-set retries of an OAuth write.
+const oauthWriteAttempts = 3
+
+// Errors a retried OAuth write closure returns so the handler can pick the
+// response; neither carries secret material.
+var (
+	errOAuthDecryptClientSecret = errors.New("decrypting client secret failed")
+	errOAuthDecryptRefreshToken = errors.New("decrypting refresh token failed")
+	errOAuthEncrypt             = errors.New("encryption failed")
+	errOAuthNoAccessToken       = errors.New("no existing access token to preserve")
+)
+
 type oauthConnectRequest struct {
 	Vault            string `json:"vault"`
 	Key              string `json:"key"`
@@ -96,36 +108,9 @@ func (s *Server) handleOAuthConnect(w http.ResponseWriter, r *http.Request) {
 	// Handle client_secret: sentinel = keep current, empty = clear, other = set new.
 	// Only reuse stored secret when the provider config hasn't changed
 	// to prevent exfiltration via a new token_url.
-	// SetCredentialOAuth bumps client_secret_version whenever a client
-	// secret ciphertext is written, so the value (new or kept) is sealed for
-	// the next version.
-	existing, _ := s.store.GetCredentialOAuth(ctx, ns.ID, req.Key)
-	var csVersion uint64
-	if existing != nil {
-		csVersion = existing.ClientSecretVersion
-	}
-	var clientSecret []byte
-	if req.ClientSecret == oauthSecretSentinel {
-		if existing != nil && existing.TokenURL == req.TokenURL && len(existing.ClientSecretCT) > 0 {
-			clientSecret, err = store.OAuthClientSecretAAD(ns.ID, req.Key, csVersion).Open(existing.ClientSecretCT, existing.ClientSecretNonce, s.encKey)
-			if err != nil {
-				jsonError(w, http.StatusInternalServerError, "Failed to decrypt client secret")
-				return
-			}
-		}
-	} else if req.ClientSecret != "" {
-		clientSecret = []byte(req.ClientSecret)
-	}
-	var clientSecretCT, clientSecretNonce []byte
-	if clientSecret != nil {
-		clientSecretCT, clientSecretNonce, err = store.OAuthClientSecretAAD(ns.ID, req.Key, csVersion+1).Seal(clientSecret, s.encKey)
-		crypto.WipeBytes(clientSecret)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "Encryption failed")
-			return
-		}
-	}
-
+	// The client secret (new or kept) is sealed for the next
+	// client_secret_version and written compare-and-set; on a conflict the
+	// row is re-read and the secret re-sealed, a bounded number of times.
 	scopeSep := req.ScopeSeparator
 	if scopeSep == "" {
 		scopeSep = " "
@@ -134,20 +119,54 @@ func (s *Server) handleOAuthConnect(w http.ResponseWriter, r *http.Request) {
 	if tokenAuthMethod == "" {
 		tokenAuthMethod = "client_secret_post"
 	}
-
-	if err := s.store.SetCredentialOAuth(ctx, &store.CredentialOAuth{
-		VaultID:          ns.ID,
-		CredentialKey:    req.Key,
-		AuthorizationURL: req.AuthorizationURL,
-		TokenURL:         req.TokenURL,
-		ClientID:         req.ClientID,
-		ClientSecretCT:   clientSecretCT,
-		ClientSecretNonce: clientSecretNonce,
-		Scopes:           req.Scopes,
-		ScopeSeparator:   scopeSep,
-		DisablePKCE:      req.DisablePKCE,
-		TokenAuthMethod:  tokenAuthMethod,
-	}); err != nil {
+	err = store.RetryOnVersionConflict(oauthWriteAttempts, func() error {
+		existing, _ := s.store.GetCredentialOAuth(ctx, ns.ID, req.Key)
+		var csVersion uint64
+		if existing != nil {
+			csVersion = existing.ClientSecretVersion
+		}
+		var clientSecret []byte
+		if req.ClientSecret == oauthSecretSentinel {
+			if existing != nil && existing.TokenURL == req.TokenURL && len(existing.ClientSecretCT) > 0 {
+				cs, err := store.OAuthClientSecretAAD(ns.ID, req.Key, csVersion).Open(existing.ClientSecretCT, existing.ClientSecretNonce, s.encKey)
+				if err != nil {
+					return errOAuthDecryptClientSecret
+				}
+				clientSecret = cs
+			}
+		} else if req.ClientSecret != "" {
+			clientSecret = []byte(req.ClientSecret)
+		}
+		row := &store.CredentialOAuth{
+			VaultID:          ns.ID,
+			CredentialKey:    req.Key,
+			AuthorizationURL: req.AuthorizationURL,
+			TokenURL:         req.TokenURL,
+			ClientID:         req.ClientID,
+			Scopes:           req.Scopes,
+			ScopeSeparator:   scopeSep,
+			DisablePKCE:      req.DisablePKCE,
+			TokenAuthMethod:  tokenAuthMethod,
+		}
+		if clientSecret != nil {
+			var err error
+			row.ClientSecretVersion = csVersion + 1
+			row.ClientSecretCT, row.ClientSecretNonce, err = store.OAuthClientSecretAAD(ns.ID, req.Key, row.ClientSecretVersion).Seal(clientSecret, s.encKey)
+			crypto.WipeBytes(clientSecret)
+			if err != nil {
+				return errOAuthEncrypt
+			}
+		}
+		return s.store.SetCredentialOAuth(ctx, row)
+	})
+	switch {
+	case errors.Is(err, errOAuthDecryptClientSecret):
+		jsonError(w, http.StatusInternalServerError, "Failed to decrypt client secret")
+		return
+	case errors.Is(err, errOAuthEncrypt):
+		jsonError(w, http.StatusInternalServerError, "Encryption failed")
+		return
+	case err != nil:
 		jsonError(w, http.StatusInternalServerError, "Failed to save OAuth configuration")
 		return
 	}
@@ -255,27 +274,16 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accessCT, accessNonce, err := store.CredentialValueAAD(st.VaultID, st.CredentialKey, s.credentialVersion(ctx, st.VaultID, st.CredentialKey)+1).Seal([]byte(tok.AccessToken), s.encKey)
-	if err != nil {
-		s.redirectOAuthComplete(w, r, "", "", "error", "Failed to encrypt access token")
-		return
-	}
-
-	var refreshCT, refreshNonce []byte
-	if tok.RefreshToken != "" {
-		refreshCT, refreshNonce, err = store.OAuthRefreshTokenAAD(st.VaultID, st.CredentialKey, oauthCfg.Version+1).Seal([]byte(tok.RefreshToken), s.encKey)
-		if err != nil {
-			s.redirectOAuthComplete(w, r, "", "", "error", "Failed to encrypt refresh token")
-			return
-		}
-	}
-
 	var expiresAt *time.Time
 	if !tok.ExpiresAt.IsZero() {
 		expiresAt = &tok.ExpiresAt
 	}
-
-	if err := s.store.UpdateCredentialOAuthTokens(ctx, st.VaultID, st.CredentialKey, accessCT, accessNonce, refreshCT, refreshNonce, expiresAt); err != nil {
+	err = s.storeOAuthTokens(ctx, st.VaultID, st.CredentialKey, []byte(tok.AccessToken), []byte(tok.RefreshToken), expiresAt)
+	if errors.Is(err, errOAuthEncrypt) {
+		s.redirectOAuthComplete(w, r, "", "", "error", "Failed to encrypt tokens")
+		return
+	}
+	if err != nil {
 		s.redirectOAuthComplete(w, r, "", "", "error", "Failed to store tokens")
 		return
 	}
@@ -435,66 +443,57 @@ func (s *Server) handleOAuthTokenUpload(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 
-		// Refresh succeeded — use the fresh tokens. Versions: SetCredentialOAuth
-		// below bumps client_secret_version (when a secret is written) but not
-		// version (no refresh token passed); UpdateCredentialOAuthTokens then
-		// bumps credentials.version and credential_oauth.version.
-		var oauthVersion, csVersion uint64
-		if existing != nil {
-			oauthVersion, csVersion = existing.Version, existing.ClientSecretVersion
-		}
-		accessCT, accessNonce, err := store.CredentialValueAAD(ns.ID, req.Key, s.credentialVersion(ctx, ns.ID, req.Key)+1).Seal([]byte(tok.AccessToken), s.encKey)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "Encryption failed")
-			return
-		}
-		refreshToken := req.RefreshToken
-		if tok.RefreshToken != "" {
-			refreshToken = tok.RefreshToken
-		}
-		refreshCT, refreshNonce, err := store.OAuthRefreshTokenAAD(ns.ID, req.Key, oauthVersion+1).Seal([]byte(refreshToken), s.encKey)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "Encryption failed")
-			return
-		}
-
-		var clientSecretCT, clientSecretNonce []byte
-		if clientSecret != "" {
-			clientSecretCT, clientSecretNonce, err = store.OAuthClientSecretAAD(ns.ID, req.Key, csVersion+1).Seal([]byte(clientSecret), s.encKey)
-			if err != nil {
-				jsonError(w, http.StatusInternalServerError, "Encryption failed")
-				return
-			}
-		}
-
+		// Refresh succeeded — use the fresh tokens. The client secret and the
+		// tokens are each sealed for their row's next version and written
+		// compare-and-set, re-read and re-sealed on a conflict.
 		if tokenURL == "" {
 			tokenURL = "manual"
 		}
 		if clientID == "" {
 			clientID = "manual"
 		}
-		oauthRow := &store.CredentialOAuth{
-			VaultID:           ns.ID,
-			CredentialKey:     req.Key,
-			TokenURL:          tokenURL,
-			ClientID:          clientID,
-			ClientSecretCT:    clientSecretCT,
-			ClientSecretNonce: clientSecretNonce,
-			TokenAuthMethod:   tokenAuthMethod,
+		err := store.RetryOnVersionConflict(oauthWriteAttempts, func() error {
+			cur, _ := s.store.GetCredentialOAuth(ctx, ns.ID, req.Key)
+			oauthRow := &store.CredentialOAuth{
+				VaultID:         ns.ID,
+				CredentialKey:   req.Key,
+				TokenURL:        tokenURL,
+				ClientID:        clientID,
+				TokenAuthMethod: tokenAuthMethod,
+			}
+			if existing != nil {
+				oauthRow.AuthorizationURL = existing.AuthorizationURL
+				oauthRow.Scopes = existing.Scopes
+				oauthRow.ScopeSeparator = existing.ScopeSeparator
+				oauthRow.DisablePKCE = existing.DisablePKCE
+			}
+			if clientSecret != "" {
+				oauthRow.ClientSecretVersion = 1
+				if cur != nil {
+					oauthRow.ClientSecretVersion = cur.ClientSecretVersion + 1
+				}
+				var err error
+				oauthRow.ClientSecretCT, oauthRow.ClientSecretNonce, err = store.OAuthClientSecretAAD(ns.ID, req.Key, oauthRow.ClientSecretVersion).Seal([]byte(clientSecret), s.encKey)
+				if err != nil {
+					return errOAuthEncrypt
+				}
+			}
+			return s.store.SetCredentialOAuth(ctx, oauthRow)
+		})
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "Failed to save OAuth configuration")
+			return
 		}
-		if existing != nil {
-			oauthRow.AuthorizationURL = existing.AuthorizationURL
-			oauthRow.Scopes = existing.Scopes
-			oauthRow.ScopeSeparator = existing.ScopeSeparator
-			oauthRow.DisablePKCE = existing.DisablePKCE
-		}
-		_ = s.store.SetCredentialOAuth(ctx, oauthRow)
 
+		refreshToken := req.RefreshToken
+		if tok.RefreshToken != "" {
+			refreshToken = tok.RefreshToken
+		}
 		var expiresAt *time.Time
 		if !tok.ExpiresAt.IsZero() {
 			expiresAt = &tok.ExpiresAt
 		}
-		if err := s.store.UpdateCredentialOAuthTokens(ctx, ns.ID, req.Key, accessCT, accessNonce, refreshCT, refreshNonce, expiresAt); err != nil {
+		if err := s.storeOAuthTokens(ctx, ns.ID, req.Key, []byte(tok.AccessToken), []byte(refreshToken), expiresAt); err != nil {
 			jsonError(w, http.StatusInternalServerError, "Failed to store tokens")
 			return
 		}
@@ -506,61 +505,26 @@ func (s *Server) handleOAuthTokenUpload(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// No new refresh token — store access token as-is (edit mode or access-only upload).
-	// UpdateCredentialOAuthTokens bumps credentials.version (always) and
-	// credential_oauth.version (when a refresh token is written), so kept
-	// values are re-sealed for the next version.
-	credVersion := s.credentialVersion(ctx, ns.ID, req.Key)
-	accessAAD := store.CredentialValueAAD(ns.ID, req.Key, credVersion+1)
-	var accessCT, accessNonce []byte
-	if isAccessSentinel {
-		cred, _ := s.store.GetCredential(ctx, ns.ID, req.Key)
-		if cred != nil && len(cred.Ciphertext) > 0 {
-			plaintext, decErr := store.CredentialValueAAD(ns.ID, req.Key, cred.Version).Open(cred.Ciphertext, cred.Nonce, s.encKey)
-			if decErr == nil && string(plaintext) != "" {
-				accessCT, accessNonce, err = accessAAD.Seal(plaintext, s.encKey)
-				crypto.WipeBytes(plaintext)
-				if err != nil {
-					jsonError(w, http.StatusInternalServerError, "Encryption failed")
-					return
-				}
-			}
+	// Kept values are read from the current rows and re-sealed for the next
+	// versions on every attempt of the compare-and-set write.
+	keptAccess := func(cred *store.Credential) []byte {
+		if cred == nil || len(cred.Ciphertext) == 0 {
+			return nil
 		}
-		if len(accessCT) == 0 && !hasNewRefreshToken {
+		pt, decErr := store.CredentialValueAAD(ns.ID, req.Key, cred.Version).Open(cred.Ciphertext, cred.Nonce, s.encKey)
+		if decErr != nil || len(pt) == 0 {
+			return nil
+		}
+		return pt
+	}
+	if isAccessSentinel && !hasNewRefreshToken {
+		cred, _ := s.store.GetCredential(ctx, ns.ID, req.Key)
+		pt := keptAccess(cred)
+		if pt == nil {
 			jsonError(w, http.StatusBadRequest, "No existing access token to preserve — provide an access_token or refresh_token")
 			return
 		}
-	} else if req.AccessToken != "" {
-		accessCT, accessNonce, err = accessAAD.Seal([]byte(req.AccessToken), s.encKey)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "Encryption failed")
-			return
-		}
-	}
-
-	var oauthVersion uint64
-	if existing != nil {
-		oauthVersion = existing.Version
-	}
-	refreshAAD := store.OAuthRefreshTokenAAD(ns.ID, req.Key, oauthVersion+1)
-	var refreshCT, refreshNonce []byte
-	if isRefreshSentinel && existing != nil && len(existing.RefreshTokenCT) > 0 {
-		pt, decErr := store.OAuthRefreshTokenAAD(ns.ID, req.Key, existing.Version).Open(existing.RefreshTokenCT, existing.RefreshTokenNonce, s.encKey)
-		if decErr != nil {
-			jsonError(w, http.StatusInternalServerError, "Failed to decrypt refresh token")
-			return
-		}
-		refreshCT, refreshNonce, err = refreshAAD.Seal(pt, s.encKey)
 		crypto.WipeBytes(pt)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "Encryption failed")
-			return
-		}
-	} else if hasNewRefreshToken {
-		refreshCT, refreshNonce, err = refreshAAD.Seal([]byte(req.RefreshToken), s.encKey)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, "Encryption failed")
-			return
-		}
 	}
 
 	// Create credential_oauth row if needed.
@@ -584,7 +548,38 @@ func (s *Server) handleOAuthTokenUpload(w http.ResponseWriter, r *http.Request) 
 	if existing != nil {
 		existingExpiresAt = existing.TokenExpiresAt
 	}
-	if err := s.store.UpdateCredentialOAuthTokens(ctx, ns.ID, req.Key, accessCT, accessNonce, refreshCT, refreshNonce, existingExpiresAt); err != nil {
+	err = s.writeOAuthTokens(ctx, ns.ID, req.Key, existingExpiresAt, func(cred *store.Credential, co *store.CredentialOAuth) ([]byte, []byte, error) {
+		var access, refresh []byte
+		if isAccessSentinel {
+			access = keptAccess(cred)
+			if access == nil && !hasNewRefreshToken {
+				return nil, nil, errOAuthNoAccessToken
+			}
+		} else if req.AccessToken != "" {
+			access = []byte(req.AccessToken)
+		}
+		if isRefreshSentinel && co != nil && len(co.RefreshTokenCT) > 0 {
+			pt, decErr := store.OAuthRefreshTokenAAD(ns.ID, req.Key, co.Version).Open(co.RefreshTokenCT, co.RefreshTokenNonce, s.encKey)
+			if decErr != nil {
+				return access, nil, errOAuthDecryptRefreshToken
+			}
+			refresh = pt
+		} else if hasNewRefreshToken {
+			refresh = []byte(req.RefreshToken)
+		}
+		return access, refresh, nil
+	})
+	switch {
+	case errors.Is(err, errOAuthNoAccessToken):
+		jsonError(w, http.StatusBadRequest, "No existing access token to preserve — provide an access_token or refresh_token")
+		return
+	case errors.Is(err, errOAuthDecryptRefreshToken):
+		jsonError(w, http.StatusInternalServerError, "Failed to decrypt refresh token")
+		return
+	case errors.Is(err, errOAuthEncrypt):
+		jsonError(w, http.StatusInternalServerError, "Encryption failed")
+		return
+	case err != nil:
 		jsonError(w, http.StatusInternalServerError, "Failed to store tokens")
 		return
 	}
@@ -606,6 +601,54 @@ func (s *Server) redirectOAuthComplete(w http.ResponseWriter, r *http.Request, v
 		u += "&message=" + url.QueryEscape(message)
 	}
 	http.Redirect(w, r, u, http.StatusFound)
+}
+
+// storeOAuthTokens writes an access token and, when refresh is non-empty, a
+// refresh token for vaultID/key (see writeOAuthTokens).
+func (s *Server) storeOAuthTokens(ctx context.Context, vaultID, key string, access, refresh []byte, expiresAt *time.Time) error {
+	return s.writeOAuthTokens(ctx, vaultID, key, expiresAt, func(*store.Credential, *store.CredentialOAuth) ([]byte, []byte, error) {
+		return append([]byte(nil), access...), append([]byte(nil), refresh...), nil
+	})
+}
+
+// writeOAuthTokens seals the tokens plain returns for the rows' next
+// versions and writes them compare-and-set. On a conflict it re-reads both
+// rows, calls plain again (so a value kept from the old row is re-read at
+// its new version) and re-seals, up to oauthWriteAttempts times. plain gets
+// the rows as read (either may be nil) and returns the access token (nil
+// stores an empty value) and the refresh token (empty keeps the stored
+// one). Both are wiped once sealed.
+func (s *Server) writeOAuthTokens(ctx context.Context, vaultID, key string, expiresAt *time.Time,
+	plain func(cred *store.Credential, co *store.CredentialOAuth) (access, refresh []byte, err error)) error {
+	return store.RetryOnVersionConflict(oauthWriteAttempts, func() error {
+		cred, _ := s.store.GetCredential(ctx, vaultID, key)
+		co, _ := s.store.GetCredentialOAuth(ctx, vaultID, key)
+		access, refresh, err := plain(cred, co)
+		defer crypto.WipeBytes(access)
+		defer crypto.WipeBytes(refresh)
+		if err != nil {
+			return err
+		}
+		u := store.OAuthTokenUpdate{AccessVersion: 1, ExpiresAt: expiresAt}
+		if cred != nil {
+			u.AccessVersion = cred.Version + 1
+		}
+		if len(access) > 0 {
+			if u.AccessCT, u.AccessNonce, err = store.CredentialValueAAD(vaultID, key, u.AccessVersion).Seal(access, s.encKey); err != nil {
+				return errOAuthEncrypt
+			}
+		}
+		if len(refresh) > 0 {
+			u.RefreshVersion = 1
+			if co != nil {
+				u.RefreshVersion = co.Version + 1
+			}
+			if u.RefreshCT, u.RefreshNonce, err = store.OAuthRefreshTokenAAD(vaultID, key, u.RefreshVersion).Seal(refresh, s.encKey); err != nil {
+				return errOAuthEncrypt
+			}
+		}
+		return s.store.UpdateCredentialOAuthTokens(ctx, vaultID, key, u)
+	})
 }
 
 // credentialVersion returns the current credentials.version of a row, or 0

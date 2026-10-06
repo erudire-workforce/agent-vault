@@ -102,7 +102,7 @@ type CredentialStore interface {
 // Passed separately to StoreCredentialProvider to keep CredentialStore minimal.
 type OAuthStore interface {
 	GetCredentialOAuth(ctx context.Context, vaultID, key string) (*store.CredentialOAuth, error)
-	UpdateCredentialOAuthTokens(ctx context.Context, vaultID, key string, accessCT, accessNonce, refreshCT, refreshNonce []byte, expiresAt *time.Time) error
+	UpdateCredentialOAuthTokens(ctx context.Context, vaultID, key string, u store.OAuthTokenUpdate) error
 	UpdateCredentialOAuthError(ctx context.Context, vaultID, key string, errMsg string) error
 }
 
@@ -414,6 +414,9 @@ func (p *StoreCredentialProvider) recordedIdentity(ctx context.Context, vaultID 
 
 const oauthRefreshBuffer = 5 * time.Minute
 
+// oauthWriteAttempts bounds the compare-and-set retries of a token write.
+const oauthWriteAttempts = 3
+
 func (p *StoreCredentialProvider) maybeRefreshOAuth(ctx context.Context, vaultID, key string, accessVersion uint64, currentToken string) (string, error) {
 	oauthCfg, err := p.OAuthStore.GetCredentialOAuth(ctx, vaultID, key)
 	if err != nil {
@@ -462,28 +465,45 @@ func (p *StoreCredentialProvider) maybeRefreshOAuth(ctx context.Context, vaultID
 			return oauth.RefreshResult{Err: fmt.Errorf("%w: %s", ErrOAuthRefreshFailed, msg)}
 		}
 
-		// The store bumps credentials.version on the access-token write and
-		// credential_oauth.version on a refresh-token write; seal for the
-		// versions the rows will have after the update.
-		accessCT, accessNonce, err := store.CredentialValueAAD(vaultID, key, accessVersion+1).Seal([]byte(tok.AccessToken), p.EncKey)
-		if err != nil {
-			return oauth.RefreshResult{Err: fmt.Errorf("%w: encrypt access token: %v", ErrOAuthRefreshFailed, err)}
-		}
-
-		var newRefreshCT, newRefreshNonce []byte
-		if tok.RefreshToken != "" {
-			newRefreshCT, newRefreshNonce, err = store.OAuthRefreshTokenAAD(vaultID, key, oauthCfg.Version+1).Seal([]byte(tok.RefreshToken), p.EncKey)
-			if err != nil {
-				return oauth.RefreshResult{Err: fmt.Errorf("%w: encrypt refresh token: %v", ErrOAuthRefreshFailed, err)}
-			}
-		}
-
 		var expiresAt *time.Time
 		if !tok.ExpiresAt.IsZero() {
 			expiresAt = &tok.ExpiresAt
 		}
 
-		if err := p.OAuthStore.UpdateCredentialOAuthTokens(ctx, vaultID, key, accessCT, accessNonce, newRefreshCT, newRefreshNonce, expiresAt); err != nil {
+		// Seal each token for the row's next version; the store writes only
+		// if the rows are still at the versions read (compare-and-set). On a
+		// conflict another writer moved a row: re-read both versions, re-seal
+		// the tokens just minted and try again, a bounded number of times.
+		refreshVersion := oauthCfg.Version
+		attempt := 0
+		err = store.RetryOnVersionConflict(oauthWriteAttempts, func() error {
+			if attempt++; attempt > 1 {
+				cred, err := p.Store.GetCredential(ctx, vaultID, key)
+				if err != nil || cred == nil {
+					return fmt.Errorf("re-reading credential: %v", err)
+				}
+				cur, err := p.OAuthStore.GetCredentialOAuth(ctx, vaultID, key)
+				if err != nil {
+					return fmt.Errorf("re-reading oauth row: %v", err)
+				}
+				accessVersion, refreshVersion = cred.Version, cur.Version
+			}
+			u := store.OAuthTokenUpdate{AccessVersion: accessVersion + 1, ExpiresAt: expiresAt}
+			var err error
+			u.AccessCT, u.AccessNonce, err = store.CredentialValueAAD(vaultID, key, u.AccessVersion).Seal([]byte(tok.AccessToken), p.EncKey)
+			if err != nil {
+				return fmt.Errorf("encrypt access token: %v", err)
+			}
+			if tok.RefreshToken != "" {
+				u.RefreshVersion = refreshVersion + 1
+				u.RefreshCT, u.RefreshNonce, err = store.OAuthRefreshTokenAAD(vaultID, key, u.RefreshVersion).Seal([]byte(tok.RefreshToken), p.EncKey)
+				if err != nil {
+					return fmt.Errorf("encrypt refresh token: %v", err)
+				}
+			}
+			return p.OAuthStore.UpdateCredentialOAuthTokens(ctx, vaultID, key, u)
+		})
+		if err != nil {
 			return oauth.RefreshResult{Err: fmt.Errorf("%w: store tokens: %v", ErrOAuthRefreshFailed, err)}
 		}
 

@@ -514,7 +514,7 @@ type Store interface {
 	// OAuth credentials
 	GetCredentialOAuth(ctx context.Context, vaultID, key string) (*CredentialOAuth, error)
 	SetCredentialOAuth(ctx context.Context, oauth *CredentialOAuth) error
-	UpdateCredentialOAuthTokens(ctx context.Context, vaultID, key string, accessCT, accessNonce, refreshCT, refreshNonce []byte, expiresAt *time.Time) error
+	UpdateCredentialOAuthTokens(ctx context.Context, vaultID, key string, u OAuthTokenUpdate) error
 	UpdateCredentialOAuthError(ctx context.Context, vaultID, key string, errMsg string) error
 
 	// OAuth states (CSRF + PKCE for consent flow)

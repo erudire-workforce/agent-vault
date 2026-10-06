@@ -1299,7 +1299,7 @@ func (m *mockStore) GetCredentialOAuth(_ context.Context, _, _ string) (*store.C
 func (m *mockStore) SetCredentialOAuth(_ context.Context, _ *store.CredentialOAuth) error {
 	return nil
 }
-func (m *mockStore) UpdateCredentialOAuthTokens(_ context.Context, _, _ string, _, _, _, _ []byte, _ *time.Time) error {
+func (m *mockStore) UpdateCredentialOAuthTokens(_ context.Context, _, _ string, _ store.OAuthTokenUpdate) error {
 	return nil
 }
 func (m *mockStore) UpdateCredentialOAuthError(_ context.Context, _, _, _ string) error {

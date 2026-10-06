@@ -1101,7 +1101,24 @@ func (s *SQLStore) SetCredentialOAuth(ctx context.Context, co *CredentialOAuth) 
 	lastRefreshedAt := s.dialect.FormatNullableTime(utcTimePtr(co.LastRefreshedAt))
 	lastRefreshErrorAt := s.dialect.FormatNullableTime(utcTimePtr(co.LastRefreshErrorAt))
 
-	_, err = tx.ExecContext(ctx,
+	// Compare-and-set, as SetCredentialVersion: a ciphertext is sealed for
+	// the version given beside it and lands only when the row is absent or
+	// still at that version minus one.
+	if co.ClientSecretCT != nil && co.ClientSecretVersion == 0 {
+		return fmt.Errorf("setting oauth credential: client secret written without the version it was sealed for")
+	}
+	if co.RefreshTokenCT != nil && co.Version == 0 {
+		return fmt.Errorf("setting oauth credential: refresh token written without the version it was sealed for")
+	}
+	var refreshVersion, clientSecretVersion int64
+	if co.RefreshTokenCT != nil {
+		refreshVersion = int64(co.Version)
+	}
+	if co.ClientSecretCT != nil {
+		clientSecretVersion = int64(co.ClientSecretVersion)
+	}
+
+	res, err := tx.ExecContext(ctx,
 		s.dialect.Rebind(`INSERT INTO credential_oauth (vault_id, credential_key, authorization_url, token_url, client_id,
 		   client_secret_ct, client_secret_nonce, scopes, scope_separator, disable_pkce, token_auth_method,
 		   refresh_token_ct, refresh_token_nonce, token_expires_at,
@@ -1115,10 +1132,10 @@ func (s *SQLStore) SetCredentialOAuth(ctx context.Context, co *CredentialOAuth) 
 		   client_secret_ct = excluded.client_secret_ct,
 		   client_secret_nonce = excluded.client_secret_nonce,
 		   client_secret_version = CASE WHEN excluded.client_secret_ct IS NOT NULL
-		     THEN credential_oauth.client_secret_version + 1
+		     THEN excluded.client_secret_version
 		     ELSE credential_oauth.client_secret_version END,
 		   version = CASE WHEN excluded.refresh_token_ct IS NOT NULL
-		     THEN credential_oauth.version + 1
+		     THEN excluded.version
 		     ELSE credential_oauth.version END,
 		   scopes = excluded.scopes,
 		   scope_separator = excluded.scope_separator,
@@ -1141,20 +1158,67 @@ func (s *SQLStore) SetCredentialOAuth(ctx context.Context, co *CredentialOAuth) 
 		     ELSE excluded.last_refreshed_at END,
 		   last_refresh_error = excluded.last_refresh_error,
 		   last_refresh_error_at = excluded.last_refresh_error_at,
-		   updated_at = excluded.updated_at`),
+		   updated_at = excluded.updated_at
+		 WHERE (excluded.client_secret_ct IS NULL OR credential_oauth.client_secret_version = excluded.client_secret_version - 1)
+		   AND (excluded.refresh_token_ct IS NULL OR credential_oauth.version = excluded.version - 1)`),
 		co.VaultID, co.CredentialKey, nullableString(co.AuthorizationURL), co.TokenURL, co.ClientID,
 		co.ClientSecretCT, co.ClientSecretNonce, nullableString(co.Scopes), scopeSep, disablePKCE, tokenAuthMethod,
 		co.RefreshTokenCT, co.RefreshTokenNonce, tokenExpiresAt,
 		connectedAt, lastRefreshedAt, nullableString(co.LastRefreshError), lastRefreshErrorAt,
-		versionIfSet(co.RefreshTokenCT), versionIfSet(co.ClientSecretCT), nowStr, nowStr,
+		refreshVersion, clientSecretVersion, nowStr, nowStr,
 	)
 	if err != nil {
 		return err
 	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrVersionConflict
+	}
 	return tx.Commit()
 }
 
-func (s *SQLStore) UpdateCredentialOAuthTokens(ctx context.Context, vaultID, key string, accessCT, accessNonce, refreshCT, refreshNonce []byte, expiresAt *time.Time) error {
+// OAuthTokenUpdate is one token write. Each ciphertext is sealed for the
+// version given beside it, which is the row's next version; the write lands
+// only if the row is still at that version minus one, otherwise
+// UpdateCredentialOAuthTokens returns ErrVersionConflict and changes nothing.
+type OAuthTokenUpdate struct {
+	AccessCT, AccessNonce []byte
+	// AccessVersion is the credentials.version AccessCT was sealed for.
+	AccessVersion uint64
+	// RefreshCT nil keeps the stored refresh token.
+	RefreshCT, RefreshNonce []byte
+	// RefreshVersion is the credential_oauth.version RefreshCT was sealed
+	// for; ignored when RefreshCT is nil.
+	RefreshVersion uint64
+	ExpiresAt      *time.Time
+}
+
+// RetryOnVersionConflict calls write up to attempts times while it returns
+// ErrVersionConflict. write must re-read the row versions and re-seal on
+// every call; the last error is returned.
+func RetryOnVersionConflict(attempts int, write func() error) error {
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = write(); !errors.Is(err, ErrVersionConflict) {
+			return err
+		}
+	}
+	return err
+}
+
+func (s *SQLStore) UpdateCredentialOAuthTokens(ctx context.Context, vaultID, key string, u OAuthTokenUpdate) error {
+	if u.AccessVersion == 0 {
+		return fmt.Errorf("updating access token: version must be > 0")
+	}
+	if u.RefreshCT != nil && u.RefreshVersion == 0 {
+		return fmt.Errorf("updating refresh token: version must be > 0")
+	}
+	accessCT, accessNonce := u.AccessCT, u.AccessNonce
+	if accessCT == nil {
+		accessCT = []byte{} // the column is NOT NULL, as in SetCredential
+	}
+	if accessNonce == nil {
+		accessNonce = []byte{}
+	}
 	nowStr := s.now()
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1163,29 +1227,40 @@ func (s *SQLStore) UpdateCredentialOAuthTokens(ctx context.Context, vaultID, key
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Update the access token in the credentials table.
-	_, err = tx.ExecContext(ctx,
-		s.dialect.Rebind(`UPDATE credentials SET ciphertext = ?, nonce = ?, version = version + 1, updated_at = ?
-		 WHERE vault_id = ? AND key = ?`),
-		accessCT, accessNonce, nowStr, vaultID, key,
+	// Access token: compare-and-set on credentials.version.
+	res, err := tx.ExecContext(ctx,
+		s.dialect.Rebind(`UPDATE credentials SET ciphertext = ?, nonce = ?, version = ?, updated_at = ?
+		 WHERE vault_id = ? AND key = ? AND version = ?`),
+		accessCT, accessNonce, int64(u.AccessVersion), nowStr, vaultID, key, int64(u.AccessVersion-1),
 	)
 	if err != nil {
 		return fmt.Errorf("updating access token: %w", err)
 	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrVersionConflict
+	}
 
-	// Update refresh state in the companion table.
-	expiresAtStr := s.dialect.FormatNullableTime(utcTimePtr(expiresAt))
+	// Refresh state in the companion table; the refresh token itself is
+	// compare-and-set on credential_oauth.version.
+	expiresAtStr := s.dialect.FormatNullableTime(utcTimePtr(u.ExpiresAt))
 
-	if refreshCT != nil {
-		_, err = tx.ExecContext(ctx,
+	if u.RefreshCT != nil {
+		res, err = tx.ExecContext(ctx,
 			s.dialect.Rebind(`UPDATE credential_oauth SET
-			   refresh_token_ct = ?, refresh_token_nonce = ?, version = version + 1,
+			   refresh_token_ct = ?, refresh_token_nonce = ?, version = ?,
 			   token_expires_at = ?, connected_at = COALESCE(connected_at, ?),
 			   last_refreshed_at = ?, last_refresh_error = NULL, last_refresh_error_at = NULL,
 			   updated_at = ?
-			 WHERE vault_id = ? AND credential_key = ?`),
-			refreshCT, refreshNonce, expiresAtStr, nowStr, nowStr, nowStr, vaultID, key,
+			 WHERE vault_id = ? AND credential_key = ? AND version = ?`),
+			u.RefreshCT, u.RefreshNonce, int64(u.RefreshVersion), expiresAtStr, nowStr, nowStr, nowStr,
+			vaultID, key, int64(u.RefreshVersion-1),
 		)
+		if err != nil {
+			return fmt.Errorf("updating oauth refresh state: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrVersionConflict
+		}
 	} else {
 		_, err = tx.ExecContext(ctx,
 			s.dialect.Rebind(`UPDATE credential_oauth SET
@@ -1195,9 +1270,9 @@ func (s *SQLStore) UpdateCredentialOAuthTokens(ctx context.Context, vaultID, key
 			 WHERE vault_id = ? AND credential_key = ?`),
 			expiresAtStr, nowStr, nowStr, nowStr, vaultID, key,
 		)
-	}
-	if err != nil {
-		return fmt.Errorf("updating oauth refresh state: %w", err)
+		if err != nil {
+			return fmt.Errorf("updating oauth refresh state: %w", err)
+		}
 	}
 
 	return tx.Commit()

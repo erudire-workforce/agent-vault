@@ -97,7 +97,15 @@ func (e *env) legacyOAuth(t *testing.T, key, access, refresh, clientSecret strin
 	aCT, aN := enc(access)
 	rCT, rN := enc(refresh)
 	exp := time.Now().Add(time.Hour)
-	if err := e.db.UpdateCredentialOAuthTokens(ctx, e.vaultID, key, aCT, aN, rCT, rN, &exp); err != nil {
+	// SetCredential above created the credentials row at version 1, and the
+	// credential_oauth row has no refresh token yet (version 0), so this
+	// write lands the access token at 2 and the refresh token at 1: the same
+	// row versions the pre-CAS store produced here.
+	if err := e.db.UpdateCredentialOAuthTokens(ctx, e.vaultID, key, store.OAuthTokenUpdate{
+		AccessCT: aCT, AccessNonce: aN, AccessVersion: 2,
+		RefreshCT: rCT, RefreshNonce: rN, RefreshVersion: 1,
+		ExpiresAt: &exp,
+	}); err != nil {
 		t.Fatal(err)
 	}
 }

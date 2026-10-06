@@ -46,22 +46,26 @@ func (f *fakeOAuthStore) GetCredentialOAuth(_ context.Context, vaultID, key stri
 	return &cp, nil
 }
 
-func (f *fakeOAuthStore) UpdateCredentialOAuthTokens(_ context.Context, vaultID, key string, accessCT, accessNonce, refreshCT, refreshNonce []byte, expiresAt *time.Time) error {
+func (f *fakeOAuthStore) UpdateCredentialOAuthTokens(_ context.Context, vaultID, key string, u store.OAuthTokenUpdate) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	// Mirrors the SQL store: every access-token write bumps
-	// credentials.version and every refresh-token write bumps
-	// credential_oauth.version (the versions are bound into the AAD).
-	if c, ok := f.creds.creds[vaultID+"|"+key]; ok {
-		c.Ciphertext, c.Nonce = accessCT, accessNonce
-		c.Version++
+	// Mirrors the SQL store: each ciphertext is written at the version it
+	// was sealed for, only if the row is still at that version minus one
+	// (the versions are bound into the AAD).
+	c, hasCred := f.creds.creds[vaultID+"|"+key]
+	r, hasRow := f.rows[vaultID+"|"+key]
+	if !hasCred || c.Version != u.AccessVersion-1 {
+		return store.ErrVersionConflict
 	}
-	if r, ok := f.rows[vaultID+"|"+key]; ok {
-		if refreshCT != nil {
-			r.RefreshTokenCT, r.RefreshTokenNonce = refreshCT, refreshNonce
-			r.Version++
+	if u.RefreshCT != nil && (!hasRow || r.Version != u.RefreshVersion-1) {
+		return store.ErrVersionConflict
+	}
+	c.Ciphertext, c.Nonce, c.Version = u.AccessCT, u.AccessNonce, u.AccessVersion
+	if hasRow {
+		if u.RefreshCT != nil {
+			r.RefreshTokenCT, r.RefreshTokenNonce, r.Version = u.RefreshCT, u.RefreshNonce, u.RefreshVersion
 		}
-		r.TokenExpiresAt = expiresAt
+		r.TokenExpiresAt = u.ExpiresAt
 	}
 	return nil
 }
