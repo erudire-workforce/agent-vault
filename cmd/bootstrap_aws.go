@@ -46,7 +46,7 @@ func startDeclarativeBootstrapIfConfigured(db store.Store, logger *slog.Logger) 
 	if tokenSecret == "" || executor == "" {
 		return fmt.Errorf("%s is set, so %s and %s are required", envBootstrapDocSecret, envBootstrapTokenSecret, envBootstrapExecutor)
 	}
-	period := time.Hour
+	period := bootstrap.RotationTickInterval
 	if v := os.Getenv(envBootstrapRotationPeriod); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil || d < time.Minute || d > 24*time.Hour {

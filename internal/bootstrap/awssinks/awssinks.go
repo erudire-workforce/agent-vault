@@ -9,6 +9,8 @@ package awssinks
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -72,9 +74,15 @@ func (s TokenSink) PutToken(ctx context.Context, agent, token string, expiresAt 
 	if err != nil {
 		return err
 	}
+	// The ClientRequestToken is the new session's stored ID (sha256 hex of
+	// the raw token, as sessions.id): a retry of the same write is
+	// idempotent and two mints never share one. The raw token is never a
+	// request parameter, because CloudTrail logs those.
+	sum := sha256.Sum256([]byte(token))
 	if _, err := s.Client.PutSecretValue(ctx, &secretsmanager.PutSecretValueInput{
-		SecretId:     aws.String(s.SecretID),
-		SecretString: aws.String(string(b)),
+		SecretId:           aws.String(s.SecretID),
+		SecretString:       aws.String(string(b)),
+		ClientRequestToken: aws.String(hex.EncodeToString(sum[:])),
 	}); err != nil {
 		// The SDK error never carries the request payload.
 		return fmt.Errorf("writing token secret: %w", err)
