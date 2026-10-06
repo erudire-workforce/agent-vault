@@ -62,3 +62,10 @@ linters:
           - gosec
         path: internal/server/kmsaad_policy_test\.go
         text: "G120|G705"
+      # Identity review-fix tests: the local users/me fake builds its body
+      # from the Authorization it received, on purpose (one digest per
+      # credential value). Test code only.
+      - linters:
+          - gosec
+        path: internal/server/reviewfix_identity_test\.go
+        text: "G705"
