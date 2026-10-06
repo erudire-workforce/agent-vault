@@ -23,7 +23,6 @@ import (
 	"go/token"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -123,42 +122,23 @@ func journalRows(tdb testDB, agentID string) ([][2]string, error) {
 // observingSink wraps the fixture sink and runs a hook on every call.
 type observingSink struct {
 	*fakeTokenSink
-	mu    sync.Mutex
 	onPut func(token string)
 	onGet func(token string)
-	log   []string // "put:<hash>" / "get:<hash>"
 }
 
 func (s *observingSink) PutToken(ctx context.Context, agent, tok string, exp time.Time) error {
 	if s.onPut != nil {
 		s.onPut(tok)
 	}
-	err := s.fakeTokenSink.PutToken(ctx, agent, tok, exp)
-	if err == nil {
-		s.mu.Lock()
-		s.log = append(s.log, "put:"+tokenHash(tok))
-		s.mu.Unlock()
-	}
-	return err
+	return s.fakeTokenSink.PutToken(ctx, agent, tok, exp)
 }
 
 func (s *observingSink) GetToken(ctx context.Context, agent string) (string, time.Time, error) {
 	tok, exp, err := s.fakeTokenSink.GetToken(ctx, agent)
-	if err == nil {
-		s.mu.Lock()
-		s.log = append(s.log, "get:"+tokenHash(tok))
-		s.mu.Unlock()
-		if s.onGet != nil {
-			s.onGet(tok)
-		}
+	if err == nil && s.onGet != nil {
+		s.onGet(tok)
 	}
 	return tok, exp, err
-}
-
-func (s *observingSink) events() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]string(nil), s.log...)
 }
 
 type journalFixture struct {
