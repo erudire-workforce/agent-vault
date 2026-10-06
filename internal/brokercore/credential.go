@@ -72,6 +72,11 @@ type InjectResult struct {
 	// refreshed during the call). The probe records its digest under this
 	// binding, never under a binding read separately.
 	ProbeBinding string
+	// ProbeCredentialID and ProbeCredentialVersion are the credentials
+	// row ID and version ProbeBinding was built from. The probe's write is
+	// conditional on the row still carrying both.
+	ProbeCredentialID      string
+	ProbeCredentialVersion uint64
 }
 
 // CredentialProvider resolves a service for (targetHost, targetPath) in
@@ -211,9 +216,10 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 	// Memoize per-key lookups so a credential shared by auth and a
 	// substitution decrypts only once.
 	cache := make(map[string]string)
-	// storedVersion binds each static value to the credential version it
-	// was sealed for, so a recorded identity is used only for that value.
-	storedVersion := make(map[string]string)
+	// storedVersion binds each static value to the credential row and the
+	// version it was sealed for, so a recorded identity is used only for
+	// that value.
+	storedVersion := make(map[string]storedRow)
 	getCredential := func(key string) (string, error) {
 		if v, ok := cache[key]; ok {
 			return v, nil
@@ -244,7 +250,7 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 			return "", fmt.Errorf("%w: credential %q", ErrOAuthNotConnected, key)
 		}
 
-		storedVersion[key] = VersionBinding(cred.Version)
+		storedVersion[key] = storedRow{id: cred.ID, version: cred.Version}
 		if cred.Type == "oauth" && p.Refresher != nil && p.OAuthStore != nil {
 			refreshed, err := p.maybeRefreshOAuth(ctx, vaultID, key, cred.Version, s)
 			if err != nil {
@@ -310,7 +316,11 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 	result.CredentialIdentity = p.recordedIdentity(ctx, vaultID, matched.Auth.CredentialKeys(), storedVersion)
 	if probe != nil {
 		if keys := matched.Auth.CredentialKeys(); len(keys) == 1 {
-			result.ProbeBinding = storedVersion[keys[0]]
+			if row, ok := storedVersion[keys[0]]; ok && row.id != "" {
+				result.ProbeBinding = VersionBinding(row.id, row.version)
+				result.ProbeCredentialID = row.id
+				result.ProbeCredentialVersion = row.version
+			}
 		}
 	}
 	return result, nil
@@ -339,36 +349,43 @@ type IdentityStore interface {
 	GetVaultSetting(ctx context.Context, vaultID, key string) (string, error)
 }
 
+// storedRow is the credentials row a static value was read from.
+type storedRow struct {
+	id      string
+	version uint64
+}
+
 // IdentitySettingKey is the vault-setting key holding the identity record
-// for credential key. Value format: "<version>:<digest>" where version is
+// for credential key. Value format: "<binding>:<digest>" where binding is
 // the VersionBinding of the stored value the probe ran with, so the digest
-// sits beside the credential version it describes.
+// sits beside the credential row and version it describes.
 func IdentitySettingKey(credentialKey string) string {
 	return store.CredentialIdentitySettingKey(credentialKey)
 }
 
 // VersionBinding is the non-secret handle that ties an identity record to
-// one stored value: the credential row's version, which is bound into the
-// value's AAD and bumped on every write (including an OAuth refresh), so
-// any change to the value invalidates the record. Deleting the credential
-// deletes the record too, so a recreated row restarting at version 1
-// cannot inherit it.
-func VersionBinding(version uint64) string {
-	return strconv.FormatUint(version, 10)
+// one stored value: the credential row's ID and version ("<id>@<version>").
+// The version is bound into the value's AAD and bumped on every write
+// (including an OAuth refresh), so any change to the value invalidates the
+// record; the row ID changes when the key is deleted and recreated, so a
+// recreated row restarting at version 1 cannot match a record left behind.
+func VersionBinding(credentialID string, version uint64) string {
+	return credentialID + "@" + strconv.FormatUint(version, 10)
 }
 
 // recordedIdentity returns the digest recorded for the single credential
 // the auth config injects, provided it was recorded for the exact stored
 // value used now. Services that inject several keys, or none, get "".
-func (p *StoreCredentialProvider) recordedIdentity(ctx context.Context, vaultID string, authKeys []string, bindings map[string]string) string {
+func (p *StoreCredentialProvider) recordedIdentity(ctx context.Context, vaultID string, authKeys []string, rows map[string]storedRow) string {
 	if len(authKeys) != 1 {
 		return ""
 	}
 	key := authKeys[0]
-	binding, ok := bindings[key]
-	if !ok {
+	row, ok := rows[key]
+	if !ok || row.id == "" {
 		return ""
 	}
+	binding := VersionBinding(row.id, row.version)
 	is, ok := p.Store.(IdentityStore)
 	if !ok {
 		return ""
@@ -377,8 +394,12 @@ func (p *StoreCredentialProvider) recordedIdentity(ctx context.Context, vaultID 
 	if err != nil {
 		return ""
 	}
-	gotBinding, digest, ok := strings.Cut(rec, ":")
-	if !ok || gotBinding != binding || len(digest) != 64 {
+	i := strings.LastIndexByte(rec, ':')
+	if i < 0 {
+		return ""
+	}
+	gotBinding, digest := rec[:i], rec[i+1:]
+	if gotBinding != binding || len(digest) != 64 {
 		return ""
 	}
 	return digest

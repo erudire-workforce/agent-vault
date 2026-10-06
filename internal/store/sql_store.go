@@ -265,6 +265,31 @@ func (s *SQLStore) SetVaultSetting(ctx context.Context, vaultID, key, value stri
 	return err
 }
 
+// SetCredentialIdentity stores the identity record for credential key, but
+// only while the credentials row still has the given id and version: a
+// probe that ran with a value since replaced, deleted or recreated writes
+// nothing. It reports whether the record was written.
+func (s *SQLStore) SetCredentialIdentity(ctx context.Context, vaultID, key, credentialID string, version uint64, value string) (bool, error) {
+	// The row check and the write are one statement. Should a concurrent
+	// delete still slip between them, the record is bound to the deleted
+	// row's ID (see brokercore.VersionBinding), so no recreated row matches
+	// it. updated_at uses CURRENT_TIMESTAMP rather than a
+	// parameter: a bind in a SELECT list has no column type to infer on
+	// Postgres, and both dialects store CURRENT_TIMESTAMP in UTC.
+	res, err := s.db.ExecContext(ctx,
+		s.dialect.Rebind(`INSERT INTO vault_settings (vault_id, key, value, updated_at)
+		 SELECT ?, ?, ?, CURRENT_TIMESTAMP WHERE EXISTS
+		   (SELECT 1 FROM credentials WHERE vault_id = ? AND key = ? AND id = ? AND version = ?)
+		 ON CONFLICT(vault_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`),
+		vaultID, CredentialIdentitySettingKey(key), value,
+		vaultID, key, credentialID, int64(version))
+	if err != nil {
+		return false, fmt.Errorf("storing credential identity: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 func (s *SQLStore) DeleteVaultSetting(ctx context.Context, vaultID, key string) error {
 	_, err := s.db.ExecContext(ctx,
 		s.dialect.Rebind(`DELETE FROM vault_settings WHERE vault_id = ? AND key = ?`),
@@ -2389,6 +2414,13 @@ func (s *SQLStore) ApplyProposal(ctx context.Context, vaultID string, proposalID
 		)
 		if err != nil {
 			return fmt.Errorf("deleting credential %q: %w", key, err)
+		}
+		// The identity record goes with the row, as in DeleteCredential.
+		if _, err = tx.ExecContext(ctx,
+			s.dialect.Rebind(`DELETE FROM vault_settings WHERE vault_id = ? AND key = ?`),
+			vaultID, CredentialIdentitySettingKey(key),
+		); err != nil {
+			return fmt.Errorf("deleting credential identity %q: %w", key, err)
 		}
 	}
 

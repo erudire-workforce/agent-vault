@@ -1,5 +1,3 @@
-//go:build reviewfix
-
 // Review-fix tests for the credential identity record (blocker 1).
 // Run with: go test -tags reviewfix ./internal/server/
 package server

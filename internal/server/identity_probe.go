@@ -39,35 +39,65 @@ const identityProbeMaxBody = 1 << 20
 // it at a local server.
 var identityProbeBaseURL = "https://" + identity.NotionHost
 
-// identityProbes de-duplicates concurrent probes per vault/key.
-var identityProbes sync.Map
+// identityProbes serializes probes per vault/key. A key present in the map
+// has a probe running; its value records whether another was requested
+// meanwhile, in which case the runner probes again once it finishes so the
+// newest value gets its own identity.
+var (
+	identityProbesMu sync.Mutex
+	identityProbes   = map[string]bool{}
+)
 
 // scheduleIdentityProbe runs the identity probe for vaultID/key in the
-// background after a credential is set or refreshed. Setting
-// AGENT_VAULT_IDENTITY_PROBE=off disables it.
+// background after a credential is set or refreshed. A request that
+// arrives while a probe for the same key is running is queued behind it,
+// never dropped. Setting AGENT_VAULT_IDENTITY_PROBE=off disables it.
 func (s *Server) scheduleIdentityProbe(vaultID, key string) {
 	if strings.EqualFold(os.Getenv("AGENT_VAULT_IDENTITY_PROBE"), "off") {
 		return
 	}
 	// Decide synchronously whether this key has a probe at all, so the
 	// common case (not a Notion credential) starts no goroutine.
-	svc, ok, err := s.identityProbeService(context.Background(), vaultID, key)
-	if err != nil || !ok {
+	if _, ok, err := s.identityProbeService(context.Background(), vaultID, key); err != nil || !ok {
 		return
 	}
 	id := vaultID + "\x00" + key
-	if _, busy := identityProbes.LoadOrStore(id, true); busy {
+	identityProbesMu.Lock()
+	if _, running := identityProbes[id]; running {
+		identityProbes[id] = true // re-queue behind the running probe
+		identityProbesMu.Unlock()
 		return
 	}
+	identityProbes[id] = false
+	identityProbesMu.Unlock()
 	go func() {
-		defer identityProbes.Delete(id)
-		ctx, cancel := context.WithTimeout(context.Background(), identityProbeTimeout)
-		defer cancel()
-		if err := s.runIdentityProbeFor(ctx, vaultID, key, svc); err != nil && s.logger != nil {
-			s.logger.Warn("credential identity not recorded",
-				slog.String("vault_id", vaultID), slog.String("key", key), slog.String("reason", err.Error()))
+		for {
+			s.runScheduledIdentityProbe(vaultID, key)
+			identityProbesMu.Lock()
+			if !identityProbes[id] {
+				delete(identityProbes, id)
+				identityProbesMu.Unlock()
+				return
+			}
+			identityProbes[id] = false
+			identityProbesMu.Unlock()
 		}
 	}()
+}
+
+func (s *Server) runScheduledIdentityProbe(vaultID, key string) {
+	ctx, cancel := context.WithTimeout(context.Background(), identityProbeTimeout)
+	defer cancel()
+	if err := s.runIdentityProbe(ctx, vaultID, key); err != nil && s.logger != nil {
+		s.logger.Warn("credential identity not recorded",
+			slog.String("vault_id", vaultID), slog.String("key", key), slog.String("reason", err.Error()))
+	}
+}
+
+// credentialIdentityWriter is the store surface for the probe's
+// conditional write (store.SQLStore implements it).
+type credentialIdentityWriter interface {
+	SetCredentialIdentity(ctx context.Context, vaultID, key, credentialID string, version uint64, value string) (bool, error)
 }
 
 // runIdentityProbe calls the provider identity endpoint with the
@@ -102,7 +132,7 @@ func (s *Server) runIdentityProbeFor(ctx context.Context, vaultID, key string, s
 	if err != nil {
 		return clear(fmt.Errorf("resolving credential: %w", err))
 	}
-	if inj == nil || inj.ProbeBinding == "" || len(inj.Headers) == 0 {
+	if inj == nil || inj.ProbeBinding == "" || inj.ProbeCredentialID == "" || len(inj.Headers) == 0 {
 		return clear(errors.New("credential is not a single stored value"))
 	}
 
@@ -139,8 +169,19 @@ func (s *Server) runIdentityProbeFor(ctx context.Context, vaultID, key string, s
 	if err != nil {
 		return clear(err)
 	}
-	if err := s.store.SetVaultSetting(ctx, vaultID, settingKey, inj.ProbeBinding+":"+digest); err != nil {
+	w, ok := s.store.(credentialIdentityWriter)
+	if !ok {
+		return clear(errors.New("store does not support conditional identity writes"))
+	}
+	// Written only if the row still has the ID and version the probe ran
+	// with: a value replaced, or deleted and recreated, while the probe was
+	// in flight gets no record from it.
+	written, err := w.SetCredentialIdentity(ctx, vaultID, key, inj.ProbeCredentialID, inj.ProbeCredentialVersion, inj.ProbeBinding+":"+digest)
+	if err != nil {
 		return fmt.Errorf("storing identity: %w", err)
+	}
+	if !written {
+		return errors.New("credential changed while the probe ran; identity not recorded")
 	}
 	if s.logger != nil {
 		s.logger.Info("credential identity recorded",
