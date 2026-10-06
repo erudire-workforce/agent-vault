@@ -96,7 +96,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -799,22 +799,25 @@ func TestProviderRotation_NoKeyValueInLogsOrResponses(t *testing.T) {
 // Start resumes open rotations: it runs the rotation loop.
 func TestProviderRotation_StartRunsRotationLoop(t *testing.T) {
 	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
+	names, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var start *ast.FuncDecl
-	for _, p := range pkgs {
-		for _, f := range p.Files {
-			for _, d := range f.Decls {
-				fd, ok := d.(*ast.FuncDecl)
-				if ok && fd.Name.Name == "Start" && fd.Recv != nil && len(fd.Recv.List) == 1 {
-					if star, ok := fd.Recv.List[0].Type.(*ast.StarExpr); ok {
-						if id, ok := star.X.(*ast.Ident); ok && id.Name == "Server" {
-							start = fd
-						}
+	for _, name := range names {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if ok && fd.Name.Name == "Start" && fd.Recv != nil && len(fd.Recv.List) == 1 {
+				if star, ok := fd.Recv.List[0].Type.(*ast.StarExpr); ok {
+					if id, ok := star.X.(*ast.Ident); ok && id.Name == "Server" {
+						start = fd
 					}
 				}
 			}
