@@ -56,6 +56,12 @@ const (
 	MaxTokenTTL = 90 * 24 * time.Hour
 )
 
+// RotationTickTimeout bounds one rotation-loop tick end to end. The tick
+// holds the bootstrap lock while it delivers the token, so a token sink
+// that hangs would otherwise keep every later rotation (and every other
+// task's bootstrap) waiting forever. A variable so tests can shorten it.
+var RotationTickTimeout = 2 * time.Minute
+
 // lockKey is the store lock all bootstrap work runs under.
 const lockKey = "agent-vault-bootstrap"
 
@@ -221,7 +227,9 @@ func RunRotationLoop(ctx context.Context, o Options, tick <-chan time.Time) {
 			if !ok {
 				return
 			}
-			rotated, err := RotateIfDue(ctx, o)
+			tickCtx, cancel := context.WithTimeout(ctx, RotationTickTimeout)
+			rotated, err := RotateIfDue(tickCtx, o)
+			cancel()
 			switch {
 			case err != nil:
 				o.log().Error("bootstrap: token rotation failed", slog.String("agent", o.Executor), slog.String("error", err.Error()))

@@ -1,5 +1,3 @@
-//go:build reviewfix
-
 // Non-blocking review item: each rotation-loop tick runs under its own
 // timeout, so a hung token sink cannot hold the bootstrap lock forever.
 //
