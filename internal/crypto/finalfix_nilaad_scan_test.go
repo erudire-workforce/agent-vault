@@ -1,10 +1,12 @@
-// Final-review item 5: no non-test code may seal a value without AAD. The
-// scan parses every non-test Go file in the module and reports
-//   - any call to crypto.Encrypt (the nil-AAD legacy seal), and
-//   - any crypto.EncryptAAD call whose AAD argument is nil, an empty
-//     []byte literal, []byte(nil) or "".
+// Final-review item 5: no non-test code may seal or open a value without
+// AAD. The scan parses every non-test Go file in the module and reports
+//   - any call to crypto.Encrypt (the nil-AAD legacy seal),
+//   - any crypto.EncryptAAD or crypto.DecryptAAD call whose AAD argument is
+//     nil, an empty []byte literal, []byte(nil) or "", and
+//   - any call to crypto.Decrypt (the nil-AAD legacy open) outside the
+//     legacy-migration allowlist below.
+//
 // It is shown to catch planted cases before its silence on the tree counts.
-// Run with: go test -tags finalfix ./internal/crypto/
 package crypto
 
 import (
@@ -20,7 +22,37 @@ import (
 
 const cryptoImportPath = "github.com/Infisical/agent-vault/internal/crypto"
 
+// legacyDecryptAllowlist names the only places that may open a nil-AAD
+// (v0.40.0) ciphertext: the one-time migration and the legacy-upgrade
+// helpers. Keys are slash paths relative to the module root; "*" allows
+// every function in the file's directory.
+var legacyDecryptAllowlist = map[string]map[string]bool{
+	"internal/aadmigrate/":  {"*": true},
+	"internal/auth/auth.go": {"UnlockLegacy": true, "verifyLegacySentinel": true},
+	"internal/ca/soft.go":   {"RewrapLegacyRootKey": true},
+}
+
+func legacyDecryptAllowed(filename, fn string) bool {
+	p := filepath.ToSlash(filename)
+	for strings.HasPrefix(p, "../") {
+		p = strings.TrimPrefix(p, "../")
+	}
+	for prefix, fns := range legacyDecryptAllowlist {
+		if strings.HasSuffix(prefix, "/") {
+			if strings.HasPrefix(p, prefix) && fns["*"] {
+				return true
+			}
+			continue
+		}
+		if p == prefix && fns[fn] {
+			return true
+		}
+	}
+	return false
+}
+
 // nilAADCalls returns "file:line: call" for every offending call in src.
+// filename is the module-relative path used for the allowlist.
 func nilAADCalls(fset *token.FileSet, filename string, src any) ([]string, error) {
 	f, err := parser.ParseFile(fset, filename, src, parser.SkipObjectResolution)
 	if err != nil {
@@ -44,30 +76,47 @@ func nilAADCalls(fset *token.FileSet, filename string, src any) ([]string, error
 		return nil, nil
 	}
 	var out []string
-	ast.Inspect(f, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-		x, ok := sel.X.(*ast.Ident)
-		if !ok || !aliases[x.Name] {
-			return true
-		}
-		pos := fset.Position(call.Pos())
-		switch sel.Sel.Name {
-		case "Encrypt":
-			out = append(out, pos.String()+": "+x.Name+".Encrypt (no AAD)")
-		case "EncryptAAD":
-			if len(call.Args) == 3 && emptyAAD(call.Args[2]) {
-				out = append(out, pos.String()+": "+x.Name+".EncryptAAD with empty AAD")
+	inspect := func(fn string, root ast.Node) {
+		ast.Inspect(root, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
 			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			x, ok := sel.X.(*ast.Ident)
+			if !ok || !aliases[x.Name] {
+				return true
+			}
+			pos := fset.Position(call.Pos())
+			switch sel.Sel.Name {
+			case "Encrypt":
+				out = append(out, pos.String()+": "+x.Name+".Encrypt (no AAD)")
+			case "EncryptAAD":
+				if len(call.Args) == 3 && emptyAAD(call.Args[2]) {
+					out = append(out, pos.String()+": "+x.Name+".EncryptAAD with empty AAD")
+				}
+			case "DecryptAAD":
+				if len(call.Args) == 4 && emptyAAD(call.Args[3]) {
+					out = append(out, pos.String()+": "+x.Name+".DecryptAAD with empty AAD")
+				}
+			case "Decrypt":
+				if !legacyDecryptAllowed(filename, fn) {
+					out = append(out, pos.String()+": "+x.Name+".Decrypt (no AAD) in "+fn+", outside the legacy-migration allowlist")
+				}
+			}
+			return true
+		})
+	}
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok {
+			inspect(fd.Name.Name, fd)
+			continue
 		}
-		return true
-	})
+		inspect("", d) // package-level vars and init expressions
+	}
 	return out, nil
 }
 
@@ -113,6 +162,40 @@ import "github.com/Infisical/agent-vault/internal/crypto"
 func f(k, a []byte) { crypto.EncryptAAD([]byte("v"), k, a) }`
 	if got, _ := nilAADCalls(token.NewFileSet(), "clean.go", clean); len(got) != 0 {
 		t.Fatalf("scanner flagged a call with AAD: %v", got)
+	}
+}
+
+// Known positive for the Decrypt rule: nil-AAD opens are flagged everywhere
+// except the allowlisted legacy-migration functions, and an allowlisted
+// function name in another file is still flagged.
+func TestFinalFix_NilAADScanCatchesPlantedDecrypts(t *testing.T) {
+	src := func(fn string) string {
+		return `package x
+import "github.com/Infisical/agent-vault/internal/crypto"
+func ` + fn + `(c, n, k []byte) {
+	crypto.Decrypt(c, n, k)
+	crypto.DecryptAAD(c, n, k, nil)
+}`
+	}
+	cases := []struct {
+		file, fn string
+		want     int
+	}{
+		{"internal/server/planted.go", "readValue", 2},          // Decrypt + DecryptAAD(nil)
+		{"internal/auth/auth.go", "Unlock", 2},                  // allowlisted file, wrong function
+		{"internal/server/auth.go", "UnlockLegacy", 2},          // allowlisted name, wrong file
+		{"internal/auth/auth.go", "UnlockLegacy", 1},            // Decrypt allowed; DecryptAAD(nil) never
+		{"internal/aadmigrate/aadmigrate.go", "rewrapRow", 1},   // same
+		{"../../internal/ca/soft.go", "RewrapLegacyRootKey", 1}, // walk-relative path, same
+	}
+	for _, c := range cases {
+		got, err := nilAADCalls(token.NewFileSet(), c.file, src(c.fn))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != c.want {
+			t.Errorf("%s %s: scanner reported %d, want %d: %v", c.file, c.fn, len(got), c.want, got)
+		}
 	}
 }
 

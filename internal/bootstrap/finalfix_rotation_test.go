@@ -84,7 +84,8 @@ func (a *ambiguousSink) PutToken(ctx context.Context, agent, token string, exp t
 // it may be the one now in the sink: the token the sink holds stays valid.
 func TestFinalFix_AmbiguousSinkFailureKeepsDeliveredTokenValid(t *testing.T) {
 	ctx := context.Background()
-	fx := newFixture(t, newSQLiteTestDB(t).Open(t), docJSON)
+	tdb := newSQLiteTestDB(t)
+	fx := newFixture(t, tdb.Open(t), docJSON)
 	sink := &ambiguousSink{fakeTokenSink: fx.tokens, failOnce: true}
 	fx.opts.Tokens = sink
 
@@ -107,6 +108,52 @@ func TestFinalFix_AmbiguousSinkFailureKeepsDeliveredTokenValid(t *testing.T) {
 	tok, _, _ = sink.GetToken(ctx, "example-executor")
 	if _, err := brokercore.NewStoreSessionResolver(fx.st).ResolveForProxy(ctx, tok, "example-integration"); err != nil {
 		t.Errorf("after the follow-up run the delivered token does not authenticate: %v", err)
+	}
+
+	// Count valid sessions, which kills both wrong fixes: "never cap" leaves
+	// an extra long-lived session, and "cap on error" shortens the
+	// delivered one. Exactly one session (the delivered token) may stay
+	// valid beyond the 15-minute grace window, and at most two are valid.
+	a, err := fx.st.GetAgentByName(ctx, "example-executor")
+	if err != nil || a == nil {
+		t.Fatalf("executor agent: %v", err)
+	}
+	rows := agentSessions(t, tdb, a.ID)
+	if n := countValid(rows, time.Now()); n > 2 {
+		t.Errorf("%d executor sessions are valid after the follow-up run; at most two", n)
+	}
+	long := 0
+	for _, r := range rows {
+		if r.exp.IsZero() || r.exp.After(time.Now().Add(15*time.Minute)) {
+			long++
+			if r.id != tokenHash(tok) {
+				t.Errorf("a session other than the delivered token stays valid beyond the grace window (expires %v)", r.exp)
+			}
+		}
+	}
+	if long != 1 {
+		t.Errorf("%d sessions valid beyond now+15m after the follow-up run; want exactly 1 (the delivered token)", long)
+	}
+
+	// Known positive for the counter: an extra full-TTL session ("never
+	// cap") is seen as a second long-lived session, and capping the
+	// delivered token ("cap on error") leaves none.
+	extraExp := time.Now().Add(720 * time.Hour)
+	if _, err := fx.st.CreateAgentToken(ctx, a.ID, &extraExp); err != nil {
+		t.Fatal(err)
+	}
+	if n := countValid(agentSessions(t, tdb, a.ID), time.Now().Add(15*time.Minute)); n != 2 {
+		t.Fatalf("counter self-check: an extra full-TTL session is counted as %d long-lived sessions, want 2", n)
+	}
+	capper, ok := fx.st.(TokenCapper)
+	if !ok {
+		t.Fatal("store does not implement TokenCapper")
+	}
+	if _, err := capper.CapAgentTokenExpiry(ctx, a.ID, "not-a-real-token", time.Now().Add(RotationOverlap)); err != nil {
+		t.Fatal(err)
+	}
+	if n := countValid(agentSessions(t, tdb, a.ID), time.Now().Add(15*time.Minute)); n != 0 {
+		t.Fatalf("counter self-check: after capping every session, %d are counted as long-lived, want 0", n)
 	}
 }
 
