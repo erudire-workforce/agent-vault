@@ -69,3 +69,9 @@ linters:
           - gosec
         path: internal/server/reviewfix_identity_test\.go
         text: "G705"
+      # Proxy review-fix tests: the echo-scrub upstream fakes write back the
+      # credential they received, on purpose, to prove the proxy scrubs it.
+      - linters:
+          - gosec
+        path: internal/mitm/reviewfix_proxy_test\.go
+        text: "G705"
