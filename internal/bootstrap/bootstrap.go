@@ -118,14 +118,6 @@ type CertSink interface {
 	PutCACert(ctx context.Context, certPEM []byte) error
 }
 
-// TokenCapper shortens an agent's other tokens. Bootstrap no longer calls
-// it (the rotation journal caps by stored session ID); it is kept only
-// because TestFinalFix_AmbiguousSinkFailureKeepsDeliveredTokenValid uses it
-// in its counter self-check. Remove it together with that use.
-type TokenCapper interface {
-	CapAgentTokenExpiry(ctx context.Context, agentID, keepRawToken string, until time.Time) (int64, error)
-}
-
 // Options configures Apply, RotateIfDue and RunRotationLoop.
 type Options struct {
 	Store    store.Store
