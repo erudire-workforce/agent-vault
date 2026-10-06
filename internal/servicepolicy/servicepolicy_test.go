@@ -15,12 +15,15 @@ func notion(path string, methods ...string) broker.Service {
 }
 
 func TestCheckServiceAllowlist(t *testing.T) {
+	// Recorded spec change (review fix, blocker 3): the allowlist is exactly
+	// GET /v1/pages/{id}, GET /v1/blocks/{id}/children and GET /v1/users/me.
+	// /v1/pages/*, POST /v1/search and POST .../query moved to the refused
+	// list, and the refusal cases below that exercise another reason now
+	// use an allowed path so that reason is still the only one.
 	ok := []broker.Service{
-		notion("/v1/pages/*", "GET"),
 		notion("/v1/pages/{id}", "GET"),
+		notion("/v1/blocks/{id}/children", "GET"),
 		notion("/v1/users/me", "GET"),
-		notion("/v1/search", "POST"),
-		notion("/v1/databases/{id}/query", "POST"),
 	}
 	for _, s := range ok {
 		if err := CheckService(s); err != nil {
@@ -28,22 +31,25 @@ func TestCheckServiceAllowlist(t *testing.T) {
 		}
 	}
 	bad := map[string]broker.Service{
-		"PATCH page":         notion("/v1/pages/*", "GET", "PATCH"),
-		"POST pages":         notion("/v1/pages/*", "POST"),
-		"methods unset":      notion("/v1/pages/*"),
-		"methods empty":      {Name: "n", Host: "api.notion.com", Path: "/v1/pages/*", Methods: []string{}, Auth: broker.Auth{Type: "bearer", Token: "T"}},
+		"pages greedy":       notion("/v1/pages/*", "GET"),
+		"POST search":        notion("/v1/search", "POST"),
+		"POST query":         notion("/v1/databases/{id}/query", "POST"),
+		"PATCH page":         notion("/v1/pages/{id}", "GET", "PATCH"),
+		"POST pages":         notion("/v1/pages/{id}", "POST"),
+		"methods unset":      notion("/v1/pages/{id}"),
+		"methods empty":      {Name: "n", Host: "api.notion.com", Path: "/v1/pages/{id}", Methods: []string{}, Auth: broker.Auth{Type: "bearer", Token: "T"}},
 		"catch-all path":     notion("", "GET"),
 		"broad prefix":       notion("/v1/*", "GET"),
 		"search with suffix": notion("/v1/search*", "POST"),
 		"unknown host":       {Name: "n", Host: "api.github.com", Path: "/x", Methods: []string{"GET"}, Auth: broker.Auth{Type: "bearer", Token: "T"}},
-		"wrong auth type":    {Name: "n", Host: "api.notion.com", Path: "/v1/pages/*", Methods: []string{"GET"}, Auth: broker.Auth{Type: "api-key", Key: "T"}},
+		"wrong auth type":    {Name: "n", Host: "api.notion.com", Path: "/v1/pages/{id}", Methods: []string{"GET"}, Auth: broker.Auth{Type: "api-key", Key: "T"}},
 		"substitutions": func() broker.Service {
-			s := notion("/v1/pages/*", "GET")
+			s := notion("/v1/pages/{id}", "GET")
 			s.Substitutions = []broker.Substitution{{Key: "K", Placeholder: "__k__"}}
 			return s
 		}(),
 		"dot segment":  notion("/v1/pages/../users", "GET"),
-		"non-443 port": func() broker.Service { s := notion("/v1/pages/*", "GET"); p := 8443; s.Port = &p; return s }(),
+		"non-443 port": func() broker.Service { s := notion("/v1/pages/{id}", "GET"); p := 8443; s.Port = &p; return s }(),
 	}
 	for name, s := range bad {
 		if err := CheckService(s); err == nil {

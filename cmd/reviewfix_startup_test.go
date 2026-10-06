@@ -1,5 +1,3 @@
-//go:build reviewfix
-
 // Review-fix startup tests. Run with: go test -tags reviewfix ./cmd/
 //
 // The startup checks are expected in attachServerExtensions (cmd/server.go),

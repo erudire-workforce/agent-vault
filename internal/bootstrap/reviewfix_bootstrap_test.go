@@ -1,5 +1,3 @@
-//go:build reviewfix
-
 // Blocker 3 at the bootstrap write path. Run with:
 // go test -tags reviewfix ./internal/bootstrap/
 //

@@ -1,5 +1,3 @@
-//go:build reviewfix
-
 // Blocker 3 at every API service write path: with the policy mode active,
 // any Notion service outside GET /v1/pages/{id}, GET /v1/blocks/{id}/children
 // and GET /v1/users/me is refused by the services API and by proposal

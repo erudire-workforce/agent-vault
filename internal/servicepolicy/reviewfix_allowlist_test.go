@@ -1,5 +1,3 @@
-//go:build reviewfix
-
 // Blocker 3: the compiled-in Notion allowlist is exactly three method+path
 // pairs. Run with: go test -tags reviewfix ./internal/servicepolicy/
 //

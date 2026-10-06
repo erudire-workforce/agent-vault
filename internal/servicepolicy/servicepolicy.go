@@ -30,13 +30,11 @@ const ModeReadonlyAllowlist = "readonly-allowlist"
 // ErrRefused wraps every policy refusal.
 var ErrRefused = errors.New("service policy")
 
-// Rule allows one method on a path. Exactly one of Prefix and Exact is
-// set. A Prefix rule covers a service path whose literal part (before the
-// first '*' or '{') starts with Prefix. An Exact rule covers only that
-// exact path pattern.
+// Rule allows one method on one exact path pattern. Placeholder names do
+// not matter ("{id}" and "{page_id}" are the same rule), but a placeholder
+// matches a single segment only; there are no prefix or wildcard rules.
 type Rule struct {
 	Method string
-	Prefix string
 	Exact  string
 }
 
@@ -55,17 +53,9 @@ var Providers = map[string]Provider{
 		Host:     "api.notion.com",
 		AuthType: "bearer",
 		Rules: []Rule{
-			{Method: "GET", Exact: "/v1/users"},
-			{Method: "GET", Prefix: "/v1/users/"},
-			{Method: "GET", Prefix: "/v1/pages/"},
-			{Method: "GET", Prefix: "/v1/blocks/"},
-			{Method: "GET", Prefix: "/v1/databases/"},
-			{Method: "GET", Prefix: "/v1/data_sources/"},
-			{Method: "GET", Exact: "/v1/comments"},
-			// Read operations Notion exposes only as POST.
-			{Method: "POST", Exact: "/v1/search"},
-			{Method: "POST", Exact: "/v1/databases/{database_id}/query"},
-			{Method: "POST", Exact: "/v1/data_sources/{data_source_id}/query"},
+			{Method: "GET", Exact: "/v1/pages/{id}"},
+			{Method: "GET", Exact: "/v1/blocks/{id}/children"},
+			{Method: "GET", Exact: "/v1/users/me"},
 		},
 	},
 }
@@ -171,18 +161,8 @@ func erasePlaceholderNames(p string) string {
 }
 
 func covered(p Provider, method, path string) bool {
-	literal := path
-	if i := strings.IndexAny(path, "*{"); i >= 0 {
-		literal = path[:i]
-	}
 	for _, r := range p.Rules {
-		if r.Method != method {
-			continue
-		}
-		if r.Exact != "" && erasePlaceholderNames(path) == erasePlaceholderNames(r.Exact) {
-			return true
-		}
-		if r.Prefix != "" && strings.HasPrefix(literal, r.Prefix) {
+		if r.Method == method && erasePlaceholderNames(path) == erasePlaceholderNames(r.Exact) {
 			return true
 		}
 	}

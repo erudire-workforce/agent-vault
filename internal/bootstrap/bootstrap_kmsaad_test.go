@@ -156,7 +156,7 @@ func (l *logBuf) String() string { l.mu.Lock(); defer l.mu.Unlock(); return l.b.
 const docJSON = `{
   "vaults": ["example-integration"],
   "services": [
-    {"vault":"example-integration","name":"notion-read","host":"api.notion.com","path":"/v1/pages/*","methods":["GET"],
+    {"vault":"example-integration","name":"notion-read","host":"api.notion.com","path":"/v1/pages/{id}","methods":["GET"],
      "auth_type":"bearer","credential_key":"NOTION_TOKEN","strict_deny":true}
   ],
   "agents": [

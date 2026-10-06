@@ -21,6 +21,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/ca"
 	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/infisical"
+	"github.com/Infisical/agent-vault/internal/kmswrap"
 	"github.com/Infisical/agent-vault/internal/mitm"
 	"github.com/Infisical/agent-vault/internal/notify"
 	"github.com/Infisical/agent-vault/internal/pidfile"
@@ -246,6 +247,12 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort int, maste
 	if err := servicepolicy.ValidateEnv(); err != nil {
 		return err
 	}
+	if err := requirePolicyModeForHardenedDeployments(); err != nil {
+		return err
+	}
+	if err := refuseExternalCredentialStores(db); err != nil {
+		return err
+	}
 	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey, db, maxRespBytes, maxReqBytes); err != nil {
 		return err
 	}
@@ -253,6 +260,43 @@ func attachServerExtensions(srv *server.Server, host string, mitmPort int, maste
 		return err
 	}
 	attachInfisicalIfConfigured(srv, logger)
+	return nil
+}
+
+// requirePolicyModeForHardenedDeployments refuses to start a deployment
+// that requires KMS or is configured from a bootstrap secret unless the
+// compiled-in service policy is active. Those are the hardened deployment
+// shapes; serving them with the policy off would let any service be
+// written. It runs before any AWS call.
+func requirePolicyModeForHardenedDeployments() error {
+	if servicepolicy.Active() {
+		return nil
+	}
+	if strings.TrimSpace(os.Getenv(envBootstrapDocSecret)) != "" {
+		return fmt.Errorf("%s is set but %s is not %q; refusing to start", envBootstrapDocSecret, servicepolicy.EnvMode, servicepolicy.ModeReadonlyAllowlist)
+	}
+	settings, err := kmswrap.SettingsFromEnv()
+	if err != nil {
+		return err
+	}
+	if settings.Required {
+		return fmt.Errorf("%s is set but %s is not %q; refusing to start", kmswrap.EnvRequire, servicepolicy.EnvMode, servicepolicy.ModeReadonlyAllowlist)
+	}
+	return nil
+}
+
+// refuseExternalCredentialStores refuses to start while any vault still
+// sources its credentials from an external store. The endpoint that
+// switched a vault to one is gone, so such a row is a leftover whose values
+// would bypass the sealed, versioned credential path.
+func refuseExternalCredentialStores(db store.Store) error {
+	rows, err := db.ListVaultCredentialStores(context.Background())
+	if err != nil {
+		return fmt.Errorf("checking external credential stores: %w", err)
+	}
+	if len(rows) > 0 {
+		return fmt.Errorf("%d vault(s) still use an external credential store (first: vault %s, kind %q); remove the vault_credential_stores rows before starting", len(rows), rows[0].VaultID, rows[0].Kind)
+	}
 	return nil
 }
 

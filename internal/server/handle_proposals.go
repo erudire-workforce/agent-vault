@@ -174,6 +174,13 @@ func (s *Server) handleProposalCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Refuse at creation what approval would refuse: the services the vault
+	// would hold once this proposal is applied must pass the compiled-in
+	// policy. Approval re-checks against the state at that time.
+	if merged, _ := proposal.MergeServices(existing, req.Services); !writeServicePolicyError(w, merged) {
+		return
+	}
+
 	// Validate that all credential references resolve to existing or proposed credentials.
 	existingKeys := s.listCredentialKeys(ctx, vaultID)
 	if err := proposal.ValidateCredentialRefs(req.Services, req.Credentials, existingKeys); err != nil {
