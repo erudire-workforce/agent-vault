@@ -145,11 +145,13 @@ func TestFinalFix_AmbiguousSinkFailureKeepsDeliveredTokenValid(t *testing.T) {
 	if n := countValid(agentSessions(t, tdb, a.ID), time.Now().Add(15*time.Minute)); n != 2 {
 		t.Fatalf("counter self-check: an extra full-TTL session is counted as %d long-lived sessions, want 2", n)
 	}
-	capper, ok := fx.st.(TokenCapper)
+	// Cap every session (keep none) through the journal's public store
+	// method, the same cut the rotation applies.
+	journal, ok := fx.st.(RotationJournal)
 	if !ok {
-		t.Fatal("store does not implement TokenCapper")
+		t.Fatal("store does not implement RotationJournal")
 	}
-	if _, err := capper.CapAgentTokenExpiry(ctx, a.ID, "not-a-real-token", time.Now().Add(RotationOverlap)); err != nil {
+	if _, err := journal.CapAgentSessionsExcept(ctx, a.ID, "not-a-session-id", time.Now().Add(RotationOverlap)); err != nil {
 		t.Fatal(err)
 	}
 	if n := countValid(agentSessions(t, tdb, a.ID), time.Now().Add(15*time.Minute)); n != 0 {

@@ -3,6 +3,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,9 +20,12 @@ import (
 )
 
 // usersMeFor returns a users/me body whose workspace depends on the bearer,
-// so each credential value has its own digest.
+// so each credential value has its own digest. The workspace name carries a
+// short hash of the bearer, never the bearer itself: an identity field that
+// contains the credential value is refused (fork change 6).
 func usersMeFor(auth string) string {
-	ws := "Workspace " + strings.TrimPrefix(auth, "Bearer ")
+	sum := sha256.Sum256([]byte(strings.TrimPrefix(auth, "Bearer ")))
+	ws := "Workspace " + hex.EncodeToString(sum[:6])
 	return `{"object":"user","id":"u","name":"example-integration","type":"bot",
  "bot":{"owner":{"type":"workspace","workspace":true},"workspace_name":"` + ws + `","workspace_id":"ws-00000000-test"}}`
 }
