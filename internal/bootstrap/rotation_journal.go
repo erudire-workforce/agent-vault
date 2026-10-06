@@ -21,12 +21,15 @@ import (
 //
 //   - planned: nothing minted yet; the next run mints.
 //   - minted: a session exists with a PendingExpiry expiry and the old
-//     session is cut to the same bound. The next run reads the sink back:
-//     if it holds the new token the write landed and the rotation is
-//     published as is; otherwise the unpublished session is replaced.
+//     session is cut to RotationOverlap (never extended). The next run
+//     reads the sink back: if it holds the new token the write landed and
+//     the rotation is published as is; if the sink cannot be read but this
+//     attempt's write succeeded and its session is still pending, it waits;
+//     otherwise the unpublished session is expired and replaced.
 //   - published: the new session has its full TTL (only after the sink was
-//     written AND read back with a matching digest); the old one is cut to
-//     RotationOverlap and revoked RevokeAfter later.
+//     written AND read back with a matching digest); the old one is revoked
+//     RevokeAfter later. A rotation with no delivered old token (first
+//     boot, or an unreadable sink) closes at once.
 //   - done: closed.
 //
 // At most two executor sessions are valid at any time: the delivered old
@@ -73,7 +76,8 @@ func fault(point string) error {
 type RotationJournal interface {
 	OpenTokenRotation(ctx context.Context, agentID string) (*store.TokenRotation, error)
 	PlanTokenRotation(ctx context.Context, agentID, oldSessionID string) (*store.TokenRotation, error)
-	MintTokenRotation(ctx context.Context, rotationID int64, pendingUntil time.Time) (string, error)
+	MintTokenRotation(ctx context.Context, rotationID int64, pendingUntil, oldUntil time.Time) (string, error)
+	MarkTokenRotationWritten(ctx context.Context, rotationID int64, newSessionID string) error
 	PublishTokenRotation(ctx context.Context, rotationID int64, fullExpiry, overlapUntil, publishedAt time.Time) error
 	RevokeTokenRotationOld(ctx context.Context, rotationID int64) error
 	FinishTokenRotation(ctx context.Context, rotationID int64) error
@@ -149,11 +153,20 @@ func resumeRotation(ctx context.Context, o Options, j RotationJournal, row *stor
 	for {
 		switch row.State {
 		case store.RotationPlanned, store.RotationMinted:
-			if err := mintAndPublish(ctx, o, j, row, ttl); err != nil {
+			confirmed, err := mintAndPublish(ctx, o, j, row, ttl)
+			if err != nil || !confirmed {
 				return false, err
 			}
 			published = true
 		case store.RotationPublished:
+			if row.OldSessionID == "" {
+				// No delivered old token to overlap with: close now.
+				if err := j.FinishTokenRotation(ctx, row.ID); err != nil {
+					return published, fmt.Errorf("bootstrap: closing the rotation: %w", err)
+				}
+				row.State = store.RotationDone
+				return published, nil
+			}
 			if row.PublishedAt != nil && o.now().Before(row.PublishedAt.Add(RevokeAfter)) {
 				// Waiting out the overlap; meanwhile keep everything but
 				// the new token capped to it.
@@ -180,44 +193,59 @@ func resumeRotation(ctx context.Context, o Options, j RotationJournal, row *stor
 	}
 }
 
-// mintAndPublish takes a planned or minted row to published.
-func mintAndPublish(ctx context.Context, o Options, j RotationJournal, row *store.TokenRotation, ttl time.Duration) error {
+// mintAndPublish takes a planned or minted row to published. It reports
+// false, with no error, when the token was written but the sink could not
+// be read back yet: the row stays minted and the next run confirms it.
+func mintAndPublish(ctx context.Context, o Options, j RotationJournal, row *store.TokenRotation, ttl time.Duration) (bool, error) {
 	if row.State == store.RotationMinted {
-		// Did an earlier attempt's write land? Then publish it as is.
-		if tok, exp, err := o.Tokens.GetToken(ctx, o.Executor); err == nil && tok != "" && store.SessionID(tok) == row.NewSessionID {
-			return publish(ctx, o, j, row, exp, ttl)
+		tok, exp, err := o.Tokens.GetToken(ctx, o.Executor)
+		switch {
+		case err == nil && tok != "" && store.SessionID(tok) == row.NewSessionID:
+			// An earlier attempt's write landed: publish it as is.
+			return true, publish(ctx, o, j, row, exp, ttl)
+		case err != nil && row.WrittenAt != nil && time.Now().Before(row.WrittenAt.Add(PendingExpiry)):
+			// Written, but the read-back is not possible yet; replacing
+			// the token now would only churn the one the executor reads.
+			o.log().Warn("bootstrap: delivered token not yet confirmed; sink unreadable", slog.String("agent", o.Executor), slog.String("error", err.Error()))
+			return false, nil
 		}
 	}
 
-	raw, err := j.MintTokenRotation(ctx, row.ID, time.Now().Add(PendingExpiry))
+	raw, err := j.MintTokenRotation(ctx, row.ID, time.Now().Add(PendingExpiry), time.Now().Add(RotationOverlap))
 	if err != nil {
-		return fmt.Errorf("bootstrap: minting token: %w", err)
+		return false, fmt.Errorf("bootstrap: minting token: %w", err)
 	}
-	row.State, row.NewSessionID = store.RotationMinted, store.SessionID(raw)
+	row.State, row.NewSessionID, row.WrittenAt = store.RotationMinted, store.SessionID(raw), nil
 	if err := fault(FaultAfterMint); err != nil {
-		return err
+		return false, err
 	}
 
 	expiresAt := o.now().Add(ttl).UTC().Truncate(time.Second)
 	if err := o.Tokens.PutToken(ctx, o.Executor, raw, expiresAt); err != nil {
 		// Outcome unknown (the write may have landed): the row stays
 		// minted and the next run reads the sink back to decide.
-		return fmt.Errorf("bootstrap: delivering token (outcome unknown; the next run reconciles): %w", err)
+		return false, fmt.Errorf("bootstrap: delivering token (outcome unknown; the next run reconciles): %w", err)
 	}
+	if err := j.MarkTokenRotationWritten(ctx, row.ID, row.NewSessionID); err != nil {
+		return false, fmt.Errorf("bootstrap: %w", err)
+	}
+	now := time.Now()
+	row.WrittenAt = &now
 	if err := fault(FaultAfterSecretWrite); err != nil {
-		return err
+		return false, err
 	}
 
 	// Read back before the new token gets its full TTL and before the old
-	// one is cut to the overlap.
+	// one is revoked.
 	got, gotExp, err := o.Tokens.GetToken(ctx, o.Executor)
 	if err != nil {
-		return fmt.Errorf("bootstrap: reading the delivered token back: %w", err)
+		o.log().Warn("bootstrap: delivered token written but not yet read back", slog.String("agent", o.Executor), slog.String("error", err.Error()))
+		return false, nil
 	}
 	if store.SessionID(got) != row.NewSessionID {
-		return errors.New("bootstrap: the token read back from the sink is not the one just written")
+		return false, errors.New("bootstrap: the token read back from the sink is not the one just written")
 	}
-	return publish(ctx, o, j, row, gotExp, ttl)
+	return true, publish(ctx, o, j, row, gotExp, ttl)
 }
 
 // publish extends the confirmed new session to the expiry the sink holds

@@ -22,9 +22,10 @@ type TokenRotation struct {
 	ID           int64
 	AgentID      string
 	State        string
-	OldSessionID string // the delivered session when the rotation was planned; "" if none was readable
-	NewSessionID string // the minted session; "" while planned
-	PublishedAt  *time.Time
+	OldSessionID string     // the delivered session when the rotation was planned; "" if none was readable
+	NewSessionID string     // the minted session; "" while planned
+	WrittenAt    *time.Time // wall-clock time the sink write of the new session returned success
+	PublishedAt  *time.Time // Options.Now time of the confirmed publish
 }
 
 // ErrRotationState is returned when a journal row is not in the state a
@@ -34,14 +35,17 @@ var ErrRotationState = errors.New("store: token rotation is not in the expected 
 // SessionID returns the stored ID of a raw session or agent token.
 func SessionID(rawToken string) string { return hashSessionToken(rawToken) }
 
+// Revoking a journal session sets its expiry to now rather than deleting
+// the row, so the record of every session minted stays.
+
 // OpenTokenRotation returns the agent's open (not done) rotation, or nil.
 func (s *SQLStore) OpenTokenRotation(ctx context.Context, agentID string) (*TokenRotation, error) {
 	var r TokenRotation
 	var oldID, newID sql.NullString
-	var publishedAt interface{}
-	err := s.db.QueryRowContext(ctx, s.dialect.Rebind(`SELECT id, agent_id, state, old_session_id, new_session_id, published_at
+	var writtenAt, publishedAt interface{}
+	err := s.db.QueryRowContext(ctx, s.dialect.Rebind(`SELECT id, agent_id, state, old_session_id, new_session_id, written_at, published_at
 		FROM token_rotations WHERE agent_id = ? AND state <> 'done' ORDER BY id DESC LIMIT 1`), agentID).
-		Scan(&r.ID, &r.AgentID, &r.State, &oldID, &newID, &publishedAt)
+		Scan(&r.ID, &r.AgentID, &r.State, &oldID, &newID, &writtenAt, &publishedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -49,6 +53,7 @@ func (s *SQLStore) OpenTokenRotation(ctx context.Context, agentID string) (*Toke
 		return nil, fmt.Errorf("reading token rotation: %w", err)
 	}
 	r.OldSessionID, r.NewSessionID = oldID.String, newID.String
+	r.WrittenAt, _ = s.dialect.ScanNullableTime(writtenAt)
 	r.PublishedAt, _ = s.dialect.ScanNullableTime(publishedAt)
 	return &r, nil
 }
@@ -69,11 +74,12 @@ func (s *SQLStore) PlanTokenRotation(ctx context.Context, agentID, oldSessionID 
 
 // MintTokenRotation mints the rotation's new session in one transaction:
 // the session left by an earlier attempt of this row (never published) is
-// deleted, a new agent token is created expiring at pendingUntil, every
-// other session of the agent except the delivered old one is deleted, the
-// old one is cut to pendingUntil (never extended), and the row moves to
-// minted naming the new session. It returns the raw token.
-func (s *SQLStore) MintTokenRotation(ctx context.Context, rotationID int64, pendingUntil time.Time) (string, error) {
+// expired now, a new agent token is created expiring at pendingUntil, every
+// other session of the agent except the delivered old one is expired now,
+// the old one is cut to oldUntil (never extended), and the row moves to
+// minted naming the new session with written_at cleared. It returns the raw
+// token.
+func (s *SQLStore) MintTokenRotation(ctx context.Context, rotationID int64, pendingUntil, oldUntil time.Time) (string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", fmt.Errorf("begin tx: %w", err)
@@ -89,32 +95,38 @@ func (s *SQLStore) MintTokenRotation(ctx context.Context, rotationID int64, pend
 	if state != RotationPlanned && state != RotationMinted {
 		return "", ErrRotationState
 	}
+	now := s.dialect.FormatTime(time.Now().UTC())
+	expire := func(where string, args ...any) error {
+		all := append(append([]any{now, agentID}, args...), now)
+		_, err := tx.ExecContext(ctx, s.dialect.Rebind(`UPDATE sessions SET expires_at = ?
+			WHERE agent_id = ? AND `+where+` AND (expires_at IS NULL OR expires_at > ?)`), all...)
+		return err
+	}
 	if prevID.String != "" {
-		if _, err := tx.ExecContext(ctx, s.dialect.Rebind(`DELETE FROM sessions WHERE id = ? AND agent_id = ?`), prevID.String, agentID); err != nil {
-			return "", fmt.Errorf("deleting unpublished session: %w", err)
+		if err := expire(`id = ?`, prevID.String); err != nil {
+			return "", fmt.Errorf("expiring unpublished session: %w", err)
 		}
 	}
 
 	raw := newAgentToken()
 	newID := hashSessionToken(raw)
-	until := s.dialect.FormatTime(pendingUntil.UTC())
 	if _, err := tx.ExecContext(ctx, s.dialect.Rebind(`INSERT INTO sessions (id, agent_id, expires_at, created_at) VALUES (?, ?, ?, ?)`),
-		newID, agentID, until, s.now()); err != nil {
+		newID, agentID, s.dialect.FormatTime(pendingUntil.UTC()), s.now()); err != nil {
 		return "", fmt.Errorf("creating pending session: %w", err)
 	}
 	if oldID.String != "" {
 		// Only the delivered old token and the new one may stay valid.
-		if _, err := tx.ExecContext(ctx, s.dialect.Rebind(`DELETE FROM sessions WHERE agent_id = ? AND id <> ? AND id <> ?`),
-			agentID, newID, oldID.String); err != nil {
-			return "", fmt.Errorf("revoking stray sessions: %w", err)
+		if err := expire(`id <> ? AND id <> ?`, newID, oldID.String); err != nil {
+			return "", fmt.Errorf("expiring stray sessions: %w", err)
 		}
 	}
+	until := s.dialect.FormatTime(oldUntil.UTC())
 	if _, err := tx.ExecContext(ctx, s.dialect.Rebind(`UPDATE sessions SET expires_at = ?
 		WHERE agent_id = ? AND id <> ? AND (expires_at IS NULL OR expires_at > ?)`),
 		until, agentID, newID, until); err != nil {
 		return "", fmt.Errorf("cutting old sessions: %w", err)
 	}
-	res, err := tx.ExecContext(ctx, s.dialect.Rebind(`UPDATE token_rotations SET state = 'minted', new_session_id = ?, updated_at = ?
+	res, err := tx.ExecContext(ctx, s.dialect.Rebind(`UPDATE token_rotations SET state = 'minted', new_session_id = ?, written_at = NULL, updated_at = ?
 		WHERE id = ? AND state IN ('planned', 'minted')`), newID, s.now(), rotationID)
 	if err != nil {
 		return "", fmt.Errorf("recording mint: %w", err)
@@ -126,6 +138,20 @@ func (s *SQLStore) MintTokenRotation(ctx context.Context, rotationID int64, pend
 		return "", err
 	}
 	return raw, nil
+}
+
+// MarkTokenRotationWritten records that the sink write of the minted
+// session returned success (its read-back is still to confirm it).
+func (s *SQLStore) MarkTokenRotationWritten(ctx context.Context, rotationID int64, newSessionID string) error {
+	res, err := s.db.ExecContext(ctx, s.dialect.Rebind(`UPDATE token_rotations SET written_at = ?, updated_at = ?
+		WHERE id = ? AND state = 'minted' AND new_session_id = ?`), s.now(), s.now(), rotationID, newSessionID)
+	if err != nil {
+		return fmt.Errorf("recording the sink write: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrRotationState
+	}
+	return nil
 }
 
 // PublishTokenRotation records a confirmed publish: the new session gets
@@ -168,7 +194,7 @@ func (s *SQLStore) PublishTokenRotation(ctx context.Context, rotationID int64, f
 	return tx.Commit()
 }
 
-// RevokeTokenRotationOld deletes every session of the rotation's agent
+// RevokeTokenRotationOld expires now every session of the rotation's agent
 // except its new (published) one. Repeating it is a no-op.
 func (s *SQLStore) RevokeTokenRotationOld(ctx context.Context, rotationID int64) error {
 	var agentID, state string
@@ -180,7 +206,7 @@ func (s *SQLStore) RevokeTokenRotationOld(ctx context.Context, rotationID int64)
 	if state != RotationPublished || newID.String == "" {
 		return ErrRotationState
 	}
-	if _, err := s.db.ExecContext(ctx, s.dialect.Rebind(`DELETE FROM sessions WHERE agent_id = ? AND id <> ?`), agentID, newID.String); err != nil {
+	if _, err := s.CapAgentSessionsExcept(ctx, agentID, newID.String, time.Now()); err != nil {
 		return fmt.Errorf("revoking old sessions: %w", err)
 	}
 	return nil

@@ -75,3 +75,10 @@ linters:
           - gosec
         path: internal/mitm/reviewfix_proxy_test\.go
         text: "G705"
+      # Rotation-journal tests: the observing sink keeps an event log
+      # accessor no current test reads. Test code only; the file is owned
+      # by the test author.
+      - linters:
+          - unused
+        path: internal/bootstrap/rotjournal_test\.go
+        text: "func \\(\\*observingSink\\)\\.events is unused"

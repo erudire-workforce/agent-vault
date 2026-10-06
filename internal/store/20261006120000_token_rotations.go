@@ -19,6 +19,7 @@ func init() {
 			old_session_id TEXT,
 			new_session_id TEXT,
 			published_at   TEXT,
+			written_at     TEXT,
 			created_at     TEXT NOT NULL DEFAULT (datetime('now')),
 			updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
 		)`
@@ -30,6 +31,7 @@ func init() {
 				old_session_id TEXT,
 				new_session_id TEXT,
 				published_at   TIMESTAMPTZ,
+				written_at     TIMESTAMPTZ,
 				created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 				updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 			)`
