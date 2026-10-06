@@ -22,6 +22,10 @@ Infisical's paid bug bounty is a separate **private, invitation-only program** c
 
 Security fixes ship in the latest release. Keep your Agent Vault installation updated proactively so you pick them up.
 
+## Known limitation: WebSocket frames
+
+The proxy scrubs echoes of an injected credential from HTTP response headers and bodies, but it does not scrub WebSocket frames. With `AGENT_VAULT_SERVICE_POLICY` off, a WebSocket upgrade is proxied as upstream Agent Vault does, credential injection included, so an upstream that echoes the credential in a frame hands it to the agent unscrubbed. With `AGENT_VAULT_SERVICE_POLICY=readonly-allowlist`, every WebSocket upgrade is refused with 403 before the upstream is contacted.
+
 ## General security contact
 
 For compliance documentation, security questionnaires, penetration-test reports and SOC 2 requests, use [security@infisical.com](mailto:security@infisical.com). That address is not a vulnerability intake channel.

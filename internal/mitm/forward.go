@@ -19,6 +19,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/ratelimit"
 	"github.com/Infisical/agent-vault/internal/requestlog"
 	"github.com/Infisical/agent-vault/internal/scrub"
+	"github.com/Infisical/agent-vault/internal/servicepolicy"
 )
 
 // actorFromScope returns the (type, id) pair used in request log rows.
@@ -254,6 +255,17 @@ func (p *Proxy) forwardRequest(
 		emit(http.StatusBadRequest, "non_canonical_path")
 		return
 	}
+	// WebSocket frames are relayed without echo scrubbing, so in the
+	// service-policy mode every Upgrade is refused before a credential is
+	// resolved or the upstream is contacted. With the mode off the upstream
+	// WebSocket behaviour (credential injection included) is unchanged.
+	if servicepolicy.Active() && isWebSocketUpgrade(r) {
+		brokercore.WriteProxyError(w, http.StatusForbidden, "websocket_refused",
+			"WebSocket upgrades are refused while the service policy mode ("+servicepolicy.EnvMode+") is active.")
+		emit(http.StatusForbidden, "websocket_refused")
+		return
+	}
+
 	ctx := brokercore.WithRequestMethod(r.Context(), r.Method)
 
 	inject, err := p.creds.Inject(ctx, scope.VaultID, host, port, matchPath)
