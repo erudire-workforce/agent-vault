@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/broker"
+	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/infisical"
 	"github.com/Infisical/agent-vault/internal/store"
 )
@@ -102,6 +103,31 @@ type credentialEntry struct {
 	// Unavailable marks a dynamic-secret row whose lease could not be minted
 	// (e.g. the machine identity lacks lease permission). No value is exposed.
 	Unavailable bool `json:"unavailable,omitempty"`
+	// Identity is the account the stored value acts as, recorded by the
+	// identity probe for exactly this row and version; absent otherwise.
+	Identity *credentialIdentity `json:"identity,omitempty"`
+}
+
+// credentialIdentity is the display form of a brokercore.IdentityRecord.
+type credentialIdentity struct {
+	WorkspaceName   string `json:"workspace_name"`
+	WorkspaceID     string `json:"workspace_id"`
+	IntegrationName string `json:"integration_name"`
+	Digest          string `json:"digest"`
+}
+
+// credentialIdentityFor returns cred's recorded identity when the record is
+// bound to this exact row and version, else nil.
+func (s *Server) credentialIdentityFor(ctx context.Context, vaultID string, cred *store.Credential) *credentialIdentity {
+	raw, err := s.store.GetVaultSetting(ctx, vaultID, brokercore.IdentitySettingKey(cred.Key))
+	if err != nil || raw == "" {
+		return nil
+	}
+	r, ok := brokercore.ParseIdentityRecord(raw)
+	if !ok || cred.ID == "" || r.Binding != brokercore.VersionBinding(cred.ID, cred.Version) {
+		return nil
+	}
+	return &credentialIdentity{WorkspaceName: r.WorkspaceName, WorkspaceID: r.WorkspaceID, IntegrationName: r.IntegrationName, Digest: r.Digest}
 }
 
 type credentialsListResponse struct {
@@ -151,6 +177,7 @@ func (s *Server) handleCredentialsList(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		entry := credentialMetadata(cred)
+		entry.Identity = s.credentialIdentityFor(ctx, ns.ID, cred)
 		if cred.Type == "oauth" {
 			s.enrichOAuthEntry(ctx, ns.ID, &entry)
 		}
@@ -173,6 +200,9 @@ func (s *Server) handleCredentialsList(w http.ResponseWriter, r *http.Request) {
 	for i, cred := range creds {
 		keys[i] = cred.Key
 		entries[i] = credentialMetadata(&cred)
+		if isMember {
+			entries[i].Identity = s.credentialIdentityFor(ctx, ns.ID, &cred)
+		}
 
 		if cred.Type == "oauth" && isMember {
 			s.enrichOAuthEntry(ctx, ns.ID, &entries[i])

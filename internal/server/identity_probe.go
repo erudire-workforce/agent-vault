@@ -16,6 +16,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/identity"
 	"github.com/Infisical/agent-vault/internal/netguard"
+	"github.com/Infisical/agent-vault/internal/scrub"
 	"github.com/Infisical/agent-vault/internal/servicepolicy"
 )
 
@@ -165,7 +166,25 @@ func (s *Server) runIdentityProbeFor(ctx context.Context, vaultID, key string, s
 	if resp.StatusCode != http.StatusOK {
 		return clear(fmt.Errorf("identity endpoint returned %d", resp.StatusCode))
 	}
-	digest, err := identity.NotionDigest(body)
+	acct, err := identity.ParseNotion(body)
+	if err != nil {
+		return clear(err)
+	}
+	// A field that equals or contains the credential (in any encoding the
+	// echo scrubber knows) would put the value in credential metadata.
+	sc := scrub.New(probeSecrets(inj.Headers)...)
+	for _, f := range []string{acct.WorkspaceName, acct.WorkspaceID, acct.IntegrationName} {
+		if sc.String(f) != f {
+			return clear(errors.New("identity response field carries the credential value"))
+		}
+	}
+	rec, err := brokercore.IdentityRecord{
+		Binding:         inj.ProbeBinding,
+		Digest:          acct.Digest,
+		WorkspaceName:   acct.WorkspaceName,
+		WorkspaceID:     acct.WorkspaceID,
+		IntegrationName: acct.IntegrationName,
+	}.Encode()
 	if err != nil {
 		return clear(err)
 	}
@@ -176,7 +195,7 @@ func (s *Server) runIdentityProbeFor(ctx context.Context, vaultID, key string, s
 	// Written only if the row still has the ID and version the probe ran
 	// with: a value replaced, or deleted and recreated, while the probe was
 	// in flight gets no record from it.
-	written, err := w.SetCredentialIdentity(ctx, vaultID, key, inj.ProbeCredentialID, inj.ProbeCredentialVersion, inj.ProbeBinding+":"+digest)
+	written, err := w.SetCredentialIdentity(ctx, vaultID, key, inj.ProbeCredentialID, inj.ProbeCredentialVersion, rec)
 	if err != nil {
 		return fmt.Errorf("storing identity: %w", err)
 	}
@@ -185,9 +204,22 @@ func (s *Server) runIdentityProbeFor(ctx context.Context, vaultID, key string, s
 	}
 	if s.logger != nil {
 		s.logger.Info("credential identity recorded",
-			slog.String("vault_id", vaultID), slog.String("key", key), slog.String("identity", digest))
+			slog.String("vault_id", vaultID), slog.String("key", key), slog.String("identity", acct.Digest))
 	}
 	return nil
+}
+
+// probeSecrets returns the values the probe injected: each header value
+// and, for "<scheme> <value>" headers, the value alone.
+func probeSecrets(headers map[string]string) []string {
+	var out []string
+	for _, v := range headers {
+		out = append(out, v)
+		if _, rest, ok := strings.Cut(v, " "); ok && rest != "" {
+			out = append(out, rest)
+		}
+	}
+	return out
 }
 
 // identityProbeService returns the vault's Notion service whose auth

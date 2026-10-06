@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/broker"
@@ -367,10 +366,40 @@ type storedRow struct {
 	version uint64
 }
 
-// IdentitySettingKey is the vault-setting key holding the identity record
-// for credential key. Value format: "<binding>:<digest>" where binding is
-// the VersionBinding of the stored value the probe ran with, so the digest
-// sits beside the credential row and version it describes.
+// IdentityRecord is the stored identity of one credential value: the
+// VersionBinding of the stored value the probe ran with, the digest the proxy
+// publishes, and the account fields shown in credential metadata. None of it
+// is secret; the probe refuses any field that carries the credential value.
+type IdentityRecord struct {
+	Binding         string `json:"binding"`
+	Digest          string `json:"digest"`
+	WorkspaceName   string `json:"workspace_name"`
+	WorkspaceID     string `json:"workspace_id"`
+	IntegrationName string `json:"integration_name"`
+}
+
+// Encode returns the record as stored in the vault setting.
+func (r IdentityRecord) Encode() (string, error) {
+	b, err := json.Marshal(r)
+	return string(b), err
+}
+
+// ParseIdentityRecord decodes a stored record. Anything else (an older
+// "<binding>:<digest>" value, a truncated or incomplete record) is not a
+// record, so no identity is reported for it.
+func ParseIdentityRecord(s string) (IdentityRecord, bool) {
+	var r IdentityRecord
+	if err := json.Unmarshal([]byte(s), &r); err != nil {
+		return IdentityRecord{}, false
+	}
+	if r.Binding == "" || len(r.Digest) != 64 || r.WorkspaceName == "" || r.WorkspaceID == "" || r.IntegrationName == "" {
+		return IdentityRecord{}, false
+	}
+	return r, true
+}
+
+// IdentitySettingKey is the vault-setting key holding the IdentityRecord
+// for credential key, bound to the credential row and version it describes.
 func IdentitySettingKey(credentialKey string) string {
 	return store.CredentialIdentitySettingKey(credentialKey)
 }
@@ -406,15 +435,11 @@ func (p *StoreCredentialProvider) recordedIdentity(ctx context.Context, vaultID 
 	if err != nil {
 		return ""
 	}
-	i := strings.LastIndexByte(rec, ':')
-	if i < 0 {
+	r, ok := ParseIdentityRecord(rec)
+	if !ok || r.Binding != binding {
 		return ""
 	}
-	gotBinding, digest := rec[:i], rec[i+1:]
-	if gotBinding != binding || len(digest) != 64 {
-		return ""
-	}
-	return digest
+	return r.Digest
 }
 
 const oauthRefreshBuffer = 5 * time.Minute

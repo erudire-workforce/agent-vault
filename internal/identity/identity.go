@@ -50,11 +50,21 @@ func Digest(provider string, fields ...string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// NotionDigest parses a Notion GET /v1/users/me response and returns
-// sha256("notion" 0x00 bot.workspace_id 0x00 bot.workspace_name 0x00 name).
-// It refuses (returns an error) when any of the three fields is missing,
-// null, empty or contains 0x00, or when the body is not a bot user object.
-func NotionDigest(usersMe []byte) (string, error) {
+// NotionAccount is the account a Notion token acts as, read from GET
+// /v1/users/me, with its identity digest. None of it is secret.
+type NotionAccount struct {
+	WorkspaceID     string
+	WorkspaceName   string
+	IntegrationName string // the bot user's name
+	Digest          string
+}
+
+// ParseNotion parses a Notion GET /v1/users/me response into the account and
+// its digest, sha256("notion" 0x00 bot.workspace_id 0x00 bot.workspace_name
+// 0x00 name). It refuses (returns an error) when any of the three fields is
+// missing, null, empty or contains 0x00, or when the body is not a bot user
+// object.
+func ParseNotion(usersMe []byte) (NotionAccount, error) {
 	var u struct {
 		Name *string `json:"name"`
 		Bot  *struct {
@@ -63,10 +73,25 @@ func NotionDigest(usersMe []byte) (string, error) {
 		} `json:"bot"`
 	}
 	if err := json.Unmarshal(usersMe, &u); err != nil {
-		return "", fmt.Errorf("identity: notion users/me is not JSON: %w", err)
+		return NotionAccount{}, fmt.Errorf("identity: notion users/me is not JSON: %w", err)
 	}
 	if u.Bot == nil || u.Name == nil || u.Bot.WorkspaceID == nil || u.Bot.WorkspaceName == nil {
-		return "", ErrIncomplete
+		return NotionAccount{}, ErrIncomplete
 	}
-	return Digest("notion", *u.Bot.WorkspaceID, *u.Bot.WorkspaceName, *u.Name)
+	a := NotionAccount{WorkspaceID: *u.Bot.WorkspaceID, WorkspaceName: *u.Bot.WorkspaceName, IntegrationName: *u.Name}
+	d, err := Digest("notion", a.WorkspaceID, a.WorkspaceName, a.IntegrationName)
+	if err != nil {
+		return NotionAccount{}, err
+	}
+	a.Digest = d
+	return a, nil
+}
+
+// NotionDigest returns ParseNotion's digest.
+func NotionDigest(usersMe []byte) (string, error) {
+	a, err := ParseNotion(usersMe)
+	if err != nil {
+		return "", err
+	}
+	return a.Digest, nil
 }

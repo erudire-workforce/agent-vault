@@ -51,7 +51,7 @@ type Credential struct {
 }
 
 // credentialIdentityPrefix prefixes the vault_settings key that holds a
-// credential's recorded identity ("<row id>@<row version>:<digest>").
+// credential's recorded identity (a JSON brokercore.IdentityRecord).
 // replaceCredentialsTx repeats it as a SQL literal; keep the two in step.
 const credentialIdentityPrefix = "credential_identity:"
 
