@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -92,7 +93,15 @@ type ServiceSpec struct {
 	AuthType      string   `json:"auth_type"`
 	CredentialKey string   `json:"credential_key"`
 	StrictDeny    bool     `json:"strict_deny"` // vault unmatched_host_policy=deny
+	// IdentityPin, when set, is the identity digest (64 lowercase hex,
+	// identity.NotionDigest) of the only account CredentialKey may act as.
+	// Apply stores it as the vault setting credential_identity_pin:<key>;
+	// the server refuses to store or inject a value with another identity.
+	IdentityPin string `json:"identity_pin,omitempty"`
 }
+
+// identityPinPattern is the only accepted form of ServiceSpec.IdentityPin.
+var identityPinPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // AgentSpec declares one agent.
 type AgentSpec struct {
@@ -285,6 +294,9 @@ func Validate(doc *Document, executor string) error {
 		svcNames[sp.Vault+"/"+sp.Name] = true
 		// In the policy mode every vault denies unmatched hosts, so every
 		// service must say so (strict_deny sets unmatched_host_policy=deny).
+		if sp.IdentityPin != "" && !identityPinPattern.MatchString(sp.IdentityPin) {
+			return fmt.Errorf("bootstrap: service %q: identity_pin must be 64 lowercase hex characters", sp.Name)
+		}
 		if servicepolicy.Active() && !sp.StrictDeny {
 			return fmt.Errorf("bootstrap: service %q: %s is active, so strict_deny must be true", sp.Name, servicepolicy.EnvMode)
 		}
@@ -448,6 +460,18 @@ func applyServices(ctx context.Context, o Options, doc *Document, vaultIDs map[s
 				return fmt.Errorf("bootstrap: vault %q: writing services: %w", vault, err)
 			}
 			o.log().Info("bootstrap: services applied", slog.String("vault", vault), slog.Int("count", len(byVault[vault])))
+		}
+		for _, sp := range doc.Services {
+			if sp.Vault != vault || sp.IdentityPin == "" {
+				continue
+			}
+			key := store.CredentialIdentityPinSettingKey(sp.CredentialKey)
+			cur, err := o.Store.GetVaultSetting(ctx, vaultID, key)
+			if (err != nil && !errors.Is(err, sql.ErrNoRows)) || cur != sp.IdentityPin {
+				if err := o.Store.SetVaultSetting(ctx, vaultID, key, sp.IdentityPin); err != nil {
+					return fmt.Errorf("bootstrap: vault %q: setting identity pin: %w", vault, err)
+				}
+			}
 		}
 		if strict[vault] {
 			cur, err := o.Store.GetVaultSetting(ctx, vaultID, settingUnmatchedHostPolicy)

@@ -1112,6 +1112,16 @@ func (s *Server) Start() error {
 		go s.infisicalDynamic.SweepOrphans(pruneCtx)
 	}
 
+	// Provider-key rotations: a pass now (resuming anything a crash left
+	// open) and one per tick.
+	rotationsDone := make(chan struct{})
+	rotationTicker := time.NewTicker(credentialRotationTickInterval)
+	defer rotationTicker.Stop()
+	go func() {
+		defer close(rotationsDone)
+		s.RunCredentialRotations(pruneCtx, rotationTicker.C)
+	}()
+
 	errCh := make(chan error, 1)
 	go func() {
 		fmt.Printf("Agent Vault server listening on %s\n", s.baseURL)
@@ -1175,6 +1185,12 @@ func (s *Server) Start() error {
 	case <-syncerDone:
 	case <-time.After(5 * time.Second):
 		fmt.Fprintln(os.Stderr, "warning: infisical syncer did not stop within 5s; skipping key wipe to avoid racing in-flight encrypts")
+		return nil
+	}
+	select {
+	case <-rotationsDone:
+	case <-time.After(5 * time.Second):
+		fmt.Fprintln(os.Stderr, "warning: credential rotation pass did not stop within 5s; skipping key wipe to avoid racing in-flight decrypts")
 		return nil
 	}
 

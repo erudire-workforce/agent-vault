@@ -62,14 +62,24 @@ func (s *Server) handleCredentialsSet(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Every key is checked (open rotation, pinned identity) before any is
+	// stored; see provider_rotation.go.
+	plans := make(map[string]pastePlan, len(req.Credentials))
+	for key, value := range req.Credentials {
+		plan, refusal := s.checkPaste(ctx, ns.ID, key, []byte(value))
+		if refusal != nil {
+			jsonError(w, refusal.status, refusal.msg)
+			return
+		}
+		plans[key] = plan
+	}
 	var setKeys []string
 	for key, value := range req.Credentials {
-		if err := s.putCredentialValue(ctx, ns.ID, key, []byte(value)); err != nil {
-			jsonError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to set credential %q", key))
+		if refusal := s.storePaste(ctx, ns.ID, key, []byte(value), plans[key]); refusal != nil {
+			jsonError(w, refusal.status, refusal.msg)
 			return
 		}
 		setKeys = append(setKeys, key)
-		s.scheduleIdentityProbe(ns.ID, key)
 	}
 
 	actor, _ := s.actorFromSession(r.Context(), sessionFromContext(r.Context()))

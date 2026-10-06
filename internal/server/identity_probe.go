@@ -137,46 +137,9 @@ func (s *Server) runIdentityProbeFor(ctx context.Context, vaultID, key string, s
 		return clear(errors.New("credential is not a single stored value"))
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, identityProbeBaseURL+identity.NotionProbePath, nil)
+	acct, _, err := probeNotion(ctx, inj.Headers)
 	if err != nil {
 		return clear(err)
-	}
-	for k, v := range inj.Headers {
-		req.Header.Set(k, v)
-	}
-	req.Header.Set("Notion-Version", identity.NotionVersion)
-	req.Header.Set("Accept", "application/json")
-	client := &http.Client{
-		Timeout: identityProbeTimeout,
-		Transport: &http.Transport{
-			DialContext:         netguard.SafeDialContext(netguard.AllowPrivateFromEnv()),
-			TLSHandshakeTimeout: 10 * time.Second,
-		},
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return clear(errors.New("identity endpoint unreachable"))
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, identityProbeMaxBody))
-	if err != nil {
-		return clear(errors.New("reading identity response failed"))
-	}
-	if resp.StatusCode != http.StatusOK {
-		return clear(fmt.Errorf("identity endpoint returned %d", resp.StatusCode))
-	}
-	acct, err := identity.ParseNotion(body)
-	if err != nil {
-		return clear(err)
-	}
-	// A field that equals or contains the credential (in any encoding the
-	// echo scrubber knows) would put the value in credential metadata.
-	sc := scrub.New(probeSecrets(inj.Headers)...)
-	for _, f := range []string{acct.WorkspaceName, acct.WorkspaceID, acct.IntegrationName} {
-		if sc.String(f) != f {
-			return clear(errors.New("identity response field carries the credential value"))
-		}
 	}
 	rec, err := brokercore.IdentityRecord{
 		Binding:         inj.ProbeBinding,
@@ -207,6 +170,62 @@ func (s *Server) runIdentityProbeFor(ctx context.Context, vaultID, key string, s
 			slog.String("vault_id", vaultID), slog.String("key", key), slog.String("identity", acct.Digest))
 	}
 	return nil
+}
+
+// errProbeUnauthorized is probeNotion's error for a 401: the provider
+// rejected the credential.
+var errProbeUnauthorized = errors.New("identity endpoint returned 401")
+
+// probeNotion calls Notion's identity endpoint with headers and returns the
+// account, the HTTP status (0 when no response) and an error unless the
+// account was read in full. A 401 returns errProbeUnauthorized. A field that
+// equals or contains the injected credential (in any encoding the echo
+// scrubber knows) is refused: it would put the value in credential
+// metadata. Errors never carry a header value.
+func probeNotion(ctx context.Context, headers map[string]string) (identity.NotionAccount, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, identityProbeBaseURL+identity.NotionProbePath, nil)
+	if err != nil {
+		return identity.NotionAccount{}, 0, errors.New("building identity request failed")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Notion-Version", identity.NotionVersion)
+	req.Header.Set("Accept", "application/json")
+	client := &http.Client{
+		Timeout: identityProbeTimeout,
+		Transport: &http.Transport{
+			DialContext:         netguard.SafeDialContext(netguard.AllowPrivateFromEnv()),
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return identity.NotionAccount{}, 0, errors.New("identity endpoint unreachable")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, identityProbeMaxBody))
+	if err != nil {
+		return identity.NotionAccount{}, resp.StatusCode, errors.New("reading identity response failed")
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return identity.NotionAccount{}, resp.StatusCode, errProbeUnauthorized
+	}
+	if resp.StatusCode != http.StatusOK {
+		return identity.NotionAccount{}, resp.StatusCode, fmt.Errorf("identity endpoint returned %d", resp.StatusCode)
+	}
+	acct, err := identity.ParseNotion(body)
+	if err != nil {
+		return identity.NotionAccount{}, resp.StatusCode, err
+	}
+	sc := scrub.New(probeSecrets(headers)...)
+	for _, f := range []string{acct.WorkspaceName, acct.WorkspaceID, acct.IntegrationName} {
+		if sc.String(f) != f {
+			return identity.NotionAccount{}, resp.StatusCode, errors.New("identity response field carries the credential value")
+		}
+	}
+	return acct, resp.StatusCode, nil
 }
 
 // probeSecrets returns the values the probe injected: each header value
