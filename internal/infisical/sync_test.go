@@ -143,11 +143,17 @@ func TestSyncerRefresh_SuccessReplacesCredentials(t *testing.T) {
 		if len(items) != 2 {
 			t.Fatalf("expected 2 items, got %d", len(items))
 		}
-		// Plaintext must round-trip after decryption.
+		// Stricter supersession of the original nil-AAD check: each synced
+		// value must round-trip with its row AAD, CredentialValueAAD(vaultID,
+		// key, 0) (version 0 is what replaceCredentialsTx inserts), and must
+		// NOT open with nil AAD.
 		for _, it := range items {
-			pt, err := crypto.Decrypt(it.Ciphertext, it.Nonce, dek)
+			pt, err := store.CredentialValueAAD("v1", it.Key, 0).Open(it.Ciphertext, it.Nonce, dek)
 			if err != nil {
-				t.Fatalf("decrypt %q: %v", it.Key, err)
+				t.Fatalf("decrypt %q with row AAD: %v", it.Key, err)
+			}
+			if _, err := crypto.Decrypt(it.Ciphertext, it.Nonce, dek); err == nil {
+				t.Fatalf("%q still opens with nil AAD; the synced value is not row-bound", it.Key)
 			}
 			switch it.Key {
 			case "ALPHA":
